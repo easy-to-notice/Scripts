@@ -1,0 +1,40 @@
+{
+  "id": "taskbar-lyric-with-spectrum-visualizer",
+  "name": "任务栏歌词+频谱",
+  "version": "1.0.0",
+  "description": "在任务栏上方显示当前歌词和专辑封面的透明浮窗，并在浮窗底部绘制跟随音频变化的实时频谱。",
+  "author": "etn",
+  "icon": "icon.svg",
+  "main": "index.js",
+  "capabilities": {
+    "audioSpectrum": true,
+    "localFiles": true
+  },
+  "requires": {
+    "echoMusicVersion": ">=2.2.9-beta.1"
+  },
+  "contributes": {
+    "windows": [
+      {
+        "id": "taskbar-lyric-spectrum",
+        "type": "floating",
+        "title": "任务栏歌词+频谱",
+        "main": "taskbar-lyric-window.js",
+        "style": "taskbar-lyric-window.css",
+        "defaultWidth": 400,
+        "defaultHeight": 40,
+        "minWidth": 200,
+        "minHeight": 24,
+        "maxWidth": 600,
+        "maxHeight": 80,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "allowOutsideWorkArea": true,
+        "resizable": true,
+        "movable": true,
+        "acceptFirstMouse": true
+      }
+    ]
+  }
+}
