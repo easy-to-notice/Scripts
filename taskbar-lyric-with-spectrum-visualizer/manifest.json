@@ -2,7 +2,7 @@
   "id": "taskbar-lyric-with-spectrum-visualizer",
   "name": "任务栏歌词+频谱",
   "version": "1.0.0",
-  "description": "在任务栏上方显示当前歌词和专辑封面的透明浮窗，并在浮窗底部绘制跟随音频变化的实时频谱。",
+  "description": "在任务栏上方显示当前歌词和专辑封面的透明浮窗，并在浮窗底部绘制跟随音频变化的实时频谱，使用前请安装频谱可视化插件。",
   "author": "etn",
   "icon": "icon.svg",
   "main": "index.js",
