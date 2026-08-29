@@ -21,7 +21,7 @@ const LYRIC_LOOKAHEAD_MS = 150;
 /** 默认任务栏高度(后备值) */
 const TASKBAR_FALLBACK_HEIGHT = 48;
 
-/** 频谱绘制固定参数（跟随共享分析器的设置，本插件不暴露频谱设置） */
+/** 频谱查询节奏固定参数（跟随共享分析器的设置，本插件不暴露频谱设置） */
 const SPECTRUM_DRAW = {
   mode: "bars",
   palette: ["#42f5b3", "#35b7ff", "#a86dff"],
@@ -119,16 +119,6 @@ const drawSpectrumBars = (context, width, height, frame) => {
   context.fill();
   context.restore();
 };
-
-/** 频谱订阅参数（不指定 binCount，跟随共享分析器） */
-const spectrumSubscriptionOptions = () => ({
-  fps: SPECTRUM_DRAW.fps,
-  fftSize: 1024,
-  smoothing: 0.72,
-  minFrequency: 20,
-  maxFrequency: 20000,
-  scale: "log",
-});
 
 // ==================== 任务栏定位 ====================
 
@@ -395,15 +385,15 @@ export function activateWindow(ctx) {
       let lastSettingsHash = "";       // 上次轮询到的设置 hash,避免重复更新
 
       // ============ 频谱状态 ============
-      let latestSpectrumFrame = null;  // 最近一次可用的频谱帧（本地订阅或主插件转发）
+      let latestSpectrumFrame = null;  // 最近一次可用的频谱帧（独立 getSnapshot 轮询获取）
       let spectrumCanvas = null;       // canvas DOM 引用
       let spectrumCtx = null;          // canvas 2d context
       let spectrumRaf = 0;             // requestAnimationFrame id
       let spectrumLastDraw = 0;        // 上次绘制时间戳
       let spectrumRenderFps = 15;      // 当前渲染帧率（由设置驱动）
-      let directSpectrumUnsub = null;  // 浮窗内直接订阅的退订函数
-      let directSpectrumOptionsKey = ""; // 直接订阅参数快照（避免重复订阅）
-      let spectrumFrameLogged = false; // 诊断：是否已打印首帧信息
+      let snapshotPolling = false;     // getSnapshot 轮询防重入（异步 IPC 未返回时跳过下一拍）
+      let snapshotLastAt = 0;          // 上次快照轮询时间戳
+      let snapshotLogged = false;      // 诊断：是否已打印首帧信息
 
       // ============ 逐字高亮 DOM 驱动 ============
       let currentActiveLineIndex = -1;
@@ -451,7 +441,8 @@ export function activateWindow(ctx) {
 
       /**
        * 设置 BroadcastChannel 监听
-       * 接收来自主插件(index.js)的设置同步与频谱帧。
+       * 接收来自主插件(index.js)的设置同步。频谱不再经此转发：
+       * 浮窗自行轮询 getSnapshot()（独立频谱查询）。
        */
       const setupChannel = () => {
         if (typeof BroadcastChannel !== "function") return;
@@ -459,10 +450,6 @@ export function activateWindow(ctx) {
         channel.onmessage = (event) => {
           const payload = event.data;
           if (!payload) return;
-          if (payload.type === "spectrum") {
-            latestSpectrumFrame = payload.frame || null;
-            return;
-          }
           if (payload.type !== "settings") return;
           receivedFromChannel = true;
           Object.assign(settings, payload.settings);
@@ -617,6 +604,10 @@ export function activateWindow(ctx) {
           return;
         }
 
+        // 独立频谱查询：按渲染节奏轮询共享分析器快照（只读，不注册订阅，
+        // 停用/启用本插件时不会增删共享订阅、不会触发分析器重建，从而不干扰主界面频谱）。
+        pollSpectrumSnapshot();
+
         const canvas = spectrumCanvas;
         if (!spectrumCtx) spectrumCtx = canvas.getContext("2d");
         const context = spectrumCtx;
@@ -643,66 +634,56 @@ export function activateWindow(ctx) {
         }
       };
 
-      // ============ 浮窗内直接订阅频谱（主路径，无需跨窗口转发） ============
-
-      /** 停止浮窗内的直接频谱订阅 */
-      const stopDirectSpectrum = () => {
-        directSpectrumUnsub?.();
-        directSpectrumUnsub = null;
-        directSpectrumOptionsKey = "";
-      };
+      // ============ 独立频谱查询（getSnapshot 轮询，不注册共享订阅） ============
 
       /**
-       * 尝试在浮窗上下文直接订阅系统音频频谱。
-       * 成功则通知主窗口停止转发（避免双份采集），并返回 true。
-       * @returns {boolean} 是否订阅成功
+       * 轮询共享分析器的频谱快照。
+       * 使用只读的 getSnapshot() 而非 subscribe()：不增删共享订阅表、不触发
+       * 原生分析器重建，因此停用/启用本插件不会干扰主界面（频谱可视化插件）的渲染。
+       * 帧的 bins 长度由共享分析器当前配置决定（= 频谱可视化插件的柱数设置），
+       * 与停用前保持一致；快照暂时取不到时保留上一帧，避免闪黑。
        */
-      const setupDirectSpectrum = () => {
-        if (!settings.enabled) return false;
-        if (!ctx.audio?.spectrum?.subscribe) return false;
-
-        const nextOptions = spectrumSubscriptionOptions();
-        const nextOptionsKey = JSON.stringify(nextOptions);
-        if (directSpectrumUnsub && directSpectrumOptionsKey === nextOptionsKey) return true;
-
-        stopDirectSpectrum();
-        try {
-          directSpectrumUnsub = ctx.audio.spectrum.subscribe(nextOptions, (frame) => {
-            latestSpectrumFrame = frame || null;
-            if (!spectrumFrameLogged && frame) {
-              spectrumFrameLogged = true;
-              console.warn("[taskbar-lyric-spectrum] 浮窗直接订阅收到帧", {
-                state: frame.state,
-                bins: frame.bins?.length ?? 0,
-                waveform: frame.waveform?.length ?? 0,
-              });
+      const pollSpectrumSnapshot = () => {
+        if (!settings.enabled) return;
+        if (snapshotPolling) return;
+        const now = performance.now();
+        const interval = 1000 / Math.max(10, spectrumRenderFps);
+        if (now - snapshotLastAt < interval) return;
+        snapshotLastAt = now;
+        snapshotPolling = true;
+        Promise.resolve()
+          .then(() => ctx.audio?.spectrum?.getSnapshot?.() ?? null)
+          .then((frame) => {
+            if (frame && Array.isArray(frame.bins)) {
+              latestSpectrumFrame = frame;
+              if (!snapshotLogged) {
+                snapshotLogged = true;
+                console.warn("[taskbar-lyric-spectrum] 独立频谱查询收到帧", {
+                  state: frame.state,
+                  bins: frame.bins?.length ?? 0,
+                  rms: frame.rms ?? 0,
+                });
+              }
             }
+          })
+          .catch((error) => {
+            console.warn("[taskbar-lyric-spectrum] 独立频谱查询失败", error);
+          })
+          .finally(() => {
+            snapshotPolling = false;
           });
-          directSpectrumOptionsKey = nextOptionsKey;
-          channel?.postMessage({ type: "spectrum-capability", mode: "direct" });
-          console.warn("[taskbar-lyric-spectrum] 浮窗直接订阅频谱成功");
-          return true;
-        } catch (error) {
-          stopDirectSpectrum();
-          console.warn("[taskbar-lyric-spectrum] 浮窗直接订阅失败，回退到主窗口转发", error);
-          channel?.postMessage({ type: "spectrum-capability", mode: "relay" });
-          return false;
-        }
       };
 
-      // 监听启用状态，动态启停/更新绘制循环与直接订阅
+      // 监听启用状态，动态启停绘制循环与快照查询
       const stopWatchSpectrum = watch(
         () => settings.enabled,
         (enabled) => {
           if (enabled) {
-            if (!setupDirectSpectrum()) {
-              // 浮窗无法直接订阅 → 依赖主窗口转发（主入口收到 relay 能力后开始转发）
-              channel?.postMessage({ type: "spectrum-capability", mode: "relay" });
-            }
             startSpectrumLoop();
           } else {
-            stopDirectSpectrum();
             stopSpectrumLoop();
+            latestSpectrumFrame = null;
+            snapshotPolling = false;
             if (spectrumCtx && spectrumCanvas) {
               spectrumCtx.clearRect(0, 0, spectrumCanvas.clientWidth, spectrumCanvas.clientHeight);
             }
@@ -1098,11 +1079,8 @@ export function activateWindow(ctx) {
           document.body.style.setProperty('-webkit-app-region', 'drag');
         }
 
-        // 12. 启动频谱：优先在浮窗内直接订阅，否则通知主窗口转发
+        // 12. 启动频谱：浮窗独立轮询 getSnapshot()（不注册共享订阅，不影响主界面频谱）
         if (settings.enabled) {
-          if (!setupDirectSpectrum()) {
-            channel?.postMessage({ type: "spectrum-capability", mode: "relay" });
-          }
           startSpectrumLoop();
         }
 
@@ -1141,7 +1119,6 @@ export function activateWindow(ctx) {
         stopWatchLock?.();
         stopWatchOverflow?.();
         stopWatchSpectrum?.();
-        stopDirectSpectrum();
         stopSpectrumLoop();
 
         window.removeEventListener('resize', onScreenResize);

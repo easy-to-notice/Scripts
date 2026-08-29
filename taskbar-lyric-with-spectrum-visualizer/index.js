@@ -1,7 +1,8 @@
 /**
  * 任务栏歌词 + 频谱可视化 - 主入口
- * 管理设置面板、窗口生命周期、BroadcastChannel 设置同步
- * 以及音频频谱订阅与转发（主上下文订阅，转发到浮窗绘制）。
+ * 管理设置面板、窗口生命周期、BroadcastChannel 设置同步。
+ * 频谱由浮窗端独立轮询 ctx.audio.spectrum.getSnapshot() 获取，
+ * 本入口不再订阅或转发频谱（避免与共享分析器互相干扰）。
  *
  * 共享常量与工具函数的权威定义在 ./shared.js 中，本文件内联了一份副本。
  * 修改常量时请同步更新 shared.js 与 taskbar-lyric-window.js 两处。
@@ -91,90 +92,6 @@ const normalizeSettings = (value) => {
   };
 };
 
-// ==================== 频谱订阅 ====================
-
-/** 频谱渲染固定参数（跟随共享分析器设置，本插件不暴露频谱设置） */
-const SPECTRUM_DRAW = {
-  fps: 15,
-};
-
-/** 频谱订阅参数（不指定 binCount，跟随共享分析器） */
-const toSpectrumSubscriptionOptions = () => ({
-  fps: SPECTRUM_DRAW.fps,
-  fftSize: 1024,
-  smoothing: 0.72,
-  minFrequency: 20,
-  maxFrequency: 20000,
-  scale: "log",
-});
-
-/**
- * 订阅系统音频频谱，并把每一帧转发到浮窗（BroadcastChannel）。
- * 仅在浮窗无法直接订阅（relay 模式）时由主窗口代收转发。
- * 设置变化时由 applySettings / activate 调用。
- */
-let unsubscribeSpectrum = null;
-let spectrumOptionsKey = "";
-/** 频谱来源模式：direct=浮窗自己订阅 / relay=主窗口转发（默认转发，收到 direct 后停止） */
-let spectrumRelayMode = "relay";
-let spectrumFrameForwarded = false; // 诊断：是否已转发过首帧
-
-/** 需要订阅频谱的条件：插件启用 + 处于 relay 模式 + 主程序支持频谱 API */
-const shouldSubscribeSpectrum = (settings, ctx) =>
-  Boolean(
-    settings.enabled &&
-    spectrumRelayMode === "relay" &&
-    ctx?.audio?.spectrum?.subscribe,
-  );
-
-const updateSpectrumSubscription = (ctx) => {
-  if (!state || !channel) return;
-  const settings = state.settings;
-
-  if (!shouldSubscribeSpectrum(settings, ctx)) {
-    unsubscribeSpectrum?.();
-    unsubscribeSpectrum = null;
-    spectrumOptionsKey = "";
-    return;
-  }
-
-  const nextOptions = toSpectrumSubscriptionOptions();
-  const nextOptionsKey = JSON.stringify(nextOptions);
-  if (unsubscribeSpectrum && spectrumOptionsKey === nextOptionsKey) return;
-
-  unsubscribeSpectrum?.();
-  unsubscribeSpectrum = ctx.audio.spectrum.subscribe(
-    nextOptions,
-    (frame) => {
-      // 仅当插件仍启用且仍为 relay 模式时才转发
-      if (!state?.settings.enabled) return;
-      if (spectrumRelayMode !== "relay") return;
-      if (!spectrumFrameForwarded && frame) {
-        spectrumFrameForwarded = true;
-        console.warn("[taskbar-lyric-spectrum] 主窗口转发首帧", {
-          state: frame.state,
-          bins: frame.bins?.length ?? 0,
-          waveform: frame.waveform?.length ?? 0,
-        });
-      }
-      try {
-        channel.postMessage({
-          type: "spectrum",
-          frame: {
-            state: frame?.state,
-            rms: frame?.rms ?? 0,
-            bins: frame?.bins,
-            waveform: frame?.waveform,
-          },
-        });
-      } catch (error) {
-        console.warn("[taskbar-lyric-spectrum] 转发频谱帧失败", error);
-      }
-    },
-  );
-  spectrumOptionsKey = nextOptionsKey;
-};
-
 // ==================== 字体扫描 ====================
 
 // 模块级状态
@@ -211,7 +128,6 @@ const broadcastSettings = () => {
 const applySettings = async (ctx, values, options = {}) => {
   if (!state) return;
   state.settings = normalizeSettings(values);
-  updateSpectrumSubscription(ctx);
   if (options.broadcast !== false) broadcastSettings();
 };
 
@@ -229,22 +145,6 @@ const setupSettingsChannel = (ctx) => {
     if (payload.type === "heartbeat") {
       lastWindowHeartbeat = payload.ts;
       heartbeatMissCount = 0; // 心跳恢复，重置丢失计数
-      return;
-    }
-    if (payload.type === "spectrum-capability") {
-      // 浮窗告知频谱来源：direct=浮窗自己订阅；relay=需要主窗口转发
-      const mode = payload.mode === "direct" ? "direct" : "relay";
-      if (spectrumRelayMode !== mode) {
-        spectrumRelayMode = mode;
-        console.warn("[taskbar-lyric-spectrum] 频谱来源模式", mode);
-      }
-      if (mode === "direct") {
-        unsubscribeSpectrum?.();
-        unsubscribeSpectrum = null;
-        spectrumOptionsKey = "";
-      } else {
-        updateSpectrumSubscription(ctx);
-      }
       return;
     }
     if (payload.type === "settings") {
@@ -736,10 +636,6 @@ const hideWindow = (ctx) => {
  * @param {Object} ctx - 插件上下文
  */
 export async function activate(ctx) {
-  // 每次激活重置频谱来源协商状态（默认主窗口转发，收到浮窗 direct 后停止）
-  spectrumRelayMode = "relay";
-  spectrumFrameForwarded = false;
-
   // 初始化状态，加载已保存的设置
   state = ctx.vue.reactive({
     settings: normalizeSettings(await ctx.storage.get(STORAGE_KEY)),
@@ -1085,9 +981,6 @@ export async function activate(ctx) {
     { id: "taskbar-lyric-spectrum" },
   );
 
-  // 初始化频谱订阅（若启用则开始接收并转发音频帧）
-  updateSpectrumSubscription(ctx);
-
   // 如果插件已启用，显示浮窗（位置由浮窗端自动检测任务栏并贴靠）
   if (state.settings.enabled) {
     showWindow(ctx);
@@ -1097,7 +990,6 @@ export async function activate(ctx) {
   const stopWatch = ctx.vue.watch(
     () => state.settings.enabled,
     (enabled) => {
-      updateSpectrumSubscription(ctx);
       if (enabled) {
         showWindow(ctx);
       } else {
@@ -1144,12 +1036,6 @@ export async function activate(ctx) {
       }
     } catch { /* 忽略轮询错误 */ }
   }, 1000);
-
-  ctx.dispose(() => {
-    unsubscribeSpectrum?.();
-    unsubscribeSpectrum = null;
-    spectrumOptionsKey = "";
-  });
 }
 
 /**
@@ -1157,11 +1043,6 @@ export async function activate(ctx) {
  * @param {Object} ctx - 插件上下文
  */
 export function deactivate(ctx) {
-  unsubscribeSpectrum?.();
-  unsubscribeSpectrum = null;
-  spectrumOptionsKey = "";
-  spectrumRelayMode = "relay";
-  spectrumFrameForwarded = false;
   hideWindow(ctx);
   ctx.windows.close(WINDOW_ID);
   if (windowRecoveryTimer) { clearInterval(windowRecoveryTimer); windowRecoveryTimer = null; }

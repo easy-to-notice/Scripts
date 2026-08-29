@@ -2,7 +2,7 @@
 
 > EchoMusic 插件 — 在 Windows 任务栏上方显示当前歌词和封面，并在浮窗底部绘制实时音频频谱
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.0.1-blue)
 ![EchoMusic](https://img.shields.io/badge/EchoMusic-%3E%3D2.2.9--beta.1-green)
 
 基于以下两个插件使用 opencode 开发，将实时频谱嵌入任务栏歌词浮窗底部：
@@ -92,8 +92,9 @@
 ## 使用指南
 
 ### 频谱显示
-- 浮窗优先在自身上下文直接订阅系统音频（`ctx.audio.spectrum`），无需跨窗口转发；若该上下文不支持，则自动回退为「主窗口订阅 + BroadcastChannel 转发」
-- 本插件不提供频谱设置项：固定柱状 + 极光配色 + 15 FPS，频谱密度跟随共享分析器（由「频谱可视化」插件的柱数等设置决定）
+- 浮窗在自身上下文按渲染节奏轮询 `ctx.audio.spectrum.getSnapshot()` 获取频谱快照（只读查询，不注册订阅、不参与主程序共享订阅表，因此停用/启用本插件不会干扰主界面「频谱可视化」插件的渲染）
+- 频谱帧的柱数/密度跟随共享分析器当前配置（由「频谱可视化」插件的柱数等设置决定），官方频谱插件停用后沿用其最后配置
+- 本插件不提供频谱设置项：固定柱状 + 极光配色 + 15 FPS
 - 浮窗用 Canvas 在底部绘制，歌词与封面位于频谱之上，保证可读性
 - 无真实音频数据（暂停/无音频）时底部不绘制任何内容，只有播放时才有频谱
 
@@ -124,7 +125,7 @@
 
 ```
 taskbar-lyric-with-spectrum-visualizer/
-├── index.js                 # 主入口 — 设置面板、窗口生命周期、频谱订阅与转发
+├── index.js                 # 主入口 — 设置面板、窗口生命周期
 ├── taskbar-lyric-window.js  # 浮窗渲染 — 歌词着色、频谱绘制、悬停控件、封面
 ├── taskbar-lyric-window.css # 浮窗样式 — 频谱画布、渐变、控件栏玻璃态
 ├── shared.js                # 共享常量与工具
@@ -137,8 +138,8 @@ taskbar-lyric-with-spectrum-visualizer/
 
 | 特性 | 实现 |
 |------|------|
-| 频谱采集 | 浮窗直连 `ctx.audio.spectrum.subscribe`，不支持时回退主窗口转发 |
-| 频谱转发 | BroadcastChannel `{ type: "spectrum", frame }`，能力协商避免双份采集 |
+| 频谱采集 | 浮窗轮询 `ctx.audio.spectrum.getSnapshot()` 获取快照，只读、不注册订阅 |
+| 频谱隔离 | 不参与共享订阅表、不触发分析器重建，停用本插件不干扰主界面频谱 |
 | 频谱绘制 | Canvas 2D，DPR 自适应，柱状固定配色 |
 | 卡拉OK着色 | YRC 逐字渐变逐字着色，非 YRC 整行 `translateX` 渐变 |
 | 进度滚动 | 33ms `requestAnimationFrame` 驱动 `translateX`，与播放同步 |
@@ -147,9 +148,13 @@ taskbar-lyric-with-spectrum-visualizer/
 
 ## 更新日志
 
+### v1.0.1
+- 频谱采集改为浮窗独立轮询 `ctx.audio.spectrum.getSnapshot()`（只读快照），不再订阅/转发共享频谱；修复停用本插件时主界面频谱卡在最后一帧的问题
+- 移除主入口与浮窗之间的频谱 relay 协商与帧转发机制
+
 ### v1.0.0
 - 任务栏歌词 + 实时频谱：浮窗底部绘制柱状频谱（固定极光配色 + 15 FPS），频谱密度跟随共享分析器（由「频谱可视化」插件的柱数等设置决定）
-- 频谱优先在浮窗内直接订阅（`ctx.audio.spectrum`），无法直连时回退为主窗口转发；无音频数据时不绘制
+- 频谱由浮窗独立轮询 `ctx.audio.spectrum.getSnapshot()` 获取（只读快照，不注册共享订阅），停用/启用本插件不会导致主界面频谱卡帧
 - 点击浮窗空白处通过内置 `host.showOnTop` API 将 EchoMusic 主窗口显示到前台（无需配置任何路径）
 - 悬停控件栏、喜欢/FM 不喜欢、封面、翻译/音译、正则过滤、任务栏贴靠、屏幕热切换、字体与颜色自定义、窗口尺寸可调、始终置顶
 - 解锁/锁定按钮默认隐藏，可在「窗口 → 显示解锁按钮」中开启
