@@ -66,7 +66,9 @@ export const normalizeSettings = (value) => {
     doubleLine: source.doubleLine ?? DEFAULT_SETTINGS.doubleLine,
     showCover: source.showCover ?? DEFAULT_SETTINGS.showCover,
     coverSize: clamp(source.coverSize ?? DEFAULT_SETTINGS.coverSize, 24, 64),
-    coverShape: source.coverShape === "square" ? "square" : "round",
+    coverShape: source.coverShape === "square" ? "square"
+      : source.coverShape === "round" ? "round"
+      : DEFAULT_SETTINGS.coverShape,
     coverPosition: source.coverPosition === "right" ? "right" : "left",
     lyricFontSize: clamp(source.lyricFontSize ?? DEFAULT_SETTINGS.lyricFontSize, 10, 24),
     secondaryFontSize: clamp(source.secondaryFontSize ?? DEFAULT_SETTINGS.secondaryFontSize, 10, 18),

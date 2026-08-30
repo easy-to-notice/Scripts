@@ -68,7 +68,9 @@ const normalizeSettings = (value) => {
     doubleLine: source.doubleLine ?? DEFAULT_SETTINGS.doubleLine,
     showCover: source.showCover ?? DEFAULT_SETTINGS.showCover,
     coverSize: clamp(source.coverSize ?? DEFAULT_SETTINGS.coverSize, 24, 64),
-    coverShape: source.coverShape === "square" ? "square" : "round",
+    coverShape: source.coverShape === "square" ? "square"
+      : source.coverShape === "round" ? "round"
+      : DEFAULT_SETTINGS.coverShape,
     coverPosition: source.coverPosition === "right" ? "right" : "left",
     lyricFontSize: clamp(source.lyricFontSize ?? DEFAULT_SETTINGS.lyricFontSize, 10, 24),
     secondaryFontSize: clamp(source.secondaryFontSize ?? DEFAULT_SETTINGS.secondaryFontSize, 10, 18),
@@ -523,8 +525,8 @@ const createSettingsComponent = (ctx) =>
             h("label", { class: "tb-lyric-settings-field" }, [
               h("span", { class: "tb-lyric-settings-label" }, "封面形状"),
               renderRadioGroup("coverShape", [
-                { label: "圆形", value: "round" },
                 { label: "方形", value: "square" },
+                { label: "圆形", value: "round" },
               ]),
             ]),
             h("label", { class: "tb-lyric-settings-field" }, [
