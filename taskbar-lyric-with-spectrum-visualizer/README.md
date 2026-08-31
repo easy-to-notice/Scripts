@@ -2,7 +2,7 @@
 
 > EchoMusic 插件 — 在 Windows 任务栏上方显示当前歌词和封面，并在浮窗底部绘制实时音频频谱
 
-![Version](https://img.shields.io/badge/version-1.0.2-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![EchoMusic](https://img.shields.io/badge/EchoMusic-%3E%3D2.2.9--beta.1-green)
 
 基于以下两个插件使用 opencode 开发，将实时频谱嵌入任务栏歌词浮窗底部：
@@ -30,6 +30,7 @@
 - 🔤 **系统字体选择** — 通过 `ctx.fonts.getAll()` API 动态加载，自定义下拉框选择
 - 🎨 **颜色自定义** — 已播放色、未播放色自由调节
 - 📏 **窗口尺寸可调** — 宽 200–600px，高 24–80px，可拖拽缩放
+- ⌨️ **全局快捷键** — 自定义 Electron 加速键（默认 `Ctrl+Alt+I`），随时一键切换浮窗显隐
 - 📌 **始终置顶** — `screen-saver` 级一次置顶 + 心跳软恢复，不干扰任务栏
 
 ## 安装
@@ -44,6 +45,7 @@
 | 设置项 | 说明 | 默认 |
 |--------|------|------|
 | 启用任务栏歌词 | 浮窗显隐 | ✅ |
+| 全局快捷键 | Electron 加速键，留空则不注册；按一次切换浮窗显隐 | `Ctrl+Alt+I` |
 
 ### 歌词
 | 设置项 | 说明 | 默认 |
@@ -147,6 +149,10 @@ taskbar-lyric-with-spectrum-visualizer/
 | 置顶保活 | `screen-saver` 级一次性置顶 + BroadcastChannel 心跳软恢复 |
 
 ## 更新日志
+
+### v1.1.0
+- 新增：全局快捷键一键切换浮窗显隐（可在设置中自定义 Electron 加速键，默认 `Ctrl+Alt+I`，留空则不注册）
+- 修复：关闭「启用任务栏歌词」（设置开关或全局快捷键切换）时浮窗不能可靠隐藏的问题 — 隐藏改为彻底销毁窗口（`ctx.windows.close`），避免保活/restack 重新弹出
 
 ### v1.0.2
 - 设置页「封面形状」中交换了方形与圆形选项的位置

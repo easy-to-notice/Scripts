@@ -46,6 +46,7 @@ const DEFAULT_SETTINGS = {
   lyricFilterEnabled: true,
   lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹",
   emptyText: "EchoMusic",
+  hotkey: "Ctrl+Alt+I",
 };
 
 // ==================== 工具函数（与 shared.js 保持同步） ====================
@@ -91,6 +92,7 @@ const normalizeSettings = (value) => {
     lyricFilterEnabled: source.lyricFilterEnabled ?? DEFAULT_SETTINGS.lyricFilterEnabled,
     lyricFilterPatterns: typeof source.lyricFilterPatterns === "string" ? source.lyricFilterPatterns : DEFAULT_SETTINGS.lyricFilterPatterns,
     emptyText: typeof source.emptyText === "string" ? source.emptyText : DEFAULT_SETTINGS.emptyText,
+    hotkey: typeof source.hotkey === "string" ? source.hotkey : DEFAULT_SETTINGS.hotkey,
   };
 };
 
@@ -503,6 +505,11 @@ const createSettingsComponent = (ctx) =>
           renderSection("启用", "控制任务栏歌词浮窗的显示", [
             renderSwitchRow("enabled", "启用任务栏歌词", "", { primary: true }),
           ]),
+          // 快捷键设置
+          renderSection("快捷键", "配置全局快捷键以快速切换任务栏歌词", [
+            renderInputField("hotkey", "全局快捷键", "默认 Ctrl+Alt+I，留空则不注册"),
+            h("div", { class: "tb-lyric-settings-field-hint" }, "格式兼容 Electron Accelerator（Ctrl/Alt/Shift/CommandOrControl + Key）"),
+          ]),
           // 歌词内容设置
           renderSection("歌词内容", "控制歌词和副文本的展示", [
             renderSwitchRow("doubleLine", "双行显示", "开启时显示两行歌词，关闭时只显示一行"),
@@ -628,9 +635,9 @@ const recoverWindow = (ctx) => {
   ctx.windows.show(WINDOW_ID, { alwaysOnTop: true });
 };
 
-/** 隐藏浮窗 */
+/** 隐藏浮窗（彻底销毁窗口，避免被保活/restack 重新弹出；启用时会通过 showWindow 重建） */
 const hideWindow = (ctx) => {
-  ctx.windows.hide(WINDOW_ID);
+  try { ctx.windows.close(WINDOW_ID); } catch { /* 忽略 */ }
 };
 
 /**
@@ -722,6 +729,13 @@ export async function activate(ctx) {
 .tb-lyric-settings-field {
   display: grid;
   gap: 8px;
+}
+
+.tb-lyric-settings-field-hint {
+  font-size: 11px;
+  color: var(--color-text-secondary, var(--text-secondary, rgba(148, 163, 184, 0.7)));
+  line-height: 1.4;
+  margin-top: -4px;
 }
 
 .tb-lyric-settings-input input {
@@ -1014,10 +1028,52 @@ export async function activate(ctx) {
   );
   ctx.dispose(stopWatchDim);
 
+  // 全局快捷键（系统级）
+  if (ctx.shortcuts?.registerGlobal) {
+    let unregister = null;
+
+    const registerHotkey = async (accelerator) => {
+      if (unregister) {
+        try { unregister(); } catch { /* 静默 */ }
+        unregister = null;
+      }
+      if (!accelerator) return;
+      try {
+        unregister = await ctx.shortcuts.registerGlobal(accelerator, () => {
+          if (!state) return;
+          state.settings.enabled = !state.settings.enabled;
+          ctx.storage.set(STORAGE_KEY, normalizeSettings({ ...state.settings }));
+          broadcastSettings();
+        });
+      } catch (e) {
+        console.warn("[taskbar-lyric-spectrum] 全局快捷键注册失败", e && e.message ? e.message : e);
+      }
+    };
+
+    registerHotkey(state.settings.hotkey);
+
+    const stopWatchHotkey = ctx.vue.watch(
+      () => state.settings.hotkey,
+      (hotkey) => registerHotkey(hotkey),
+    );
+    ctx.dispose(stopWatchHotkey);
+    ctx.dispose(() => {
+      if (unregister) {
+        try { unregister(); } catch { /* 静默 */ }
+        unregister = null;
+      }
+    });
+  }
+
   // 窗口保活轮询：每 1s 轻量恢复置顶，通过 BroadcastChannel 心跳检测窗口存活。
   // 仅锁定时保活以免干扰拖拽。窗口真的死了（连续 3 次无心跳 = 6s）才重建。
   windowRecoveryTimer = setInterval(() => {
     try {
+      // 仅在启用状态下做保活，避免把已禁用的窗口反复重新显示出来
+      if (!state.settings.enabled) {
+        heartbeatMissCount = 0;
+        return;
+      }
       if (state.settings.lockPosition) {
         recoverWindow(ctx);
       }
@@ -1046,7 +1102,6 @@ export async function activate(ctx) {
  */
 export function deactivate(ctx) {
   hideWindow(ctx);
-  ctx.windows.close(WINDOW_ID);
   if (windowRecoveryTimer) { clearInterval(windowRecoveryTimer); windowRecoveryTimer = null; }
   channel?.close();
   channel = null;

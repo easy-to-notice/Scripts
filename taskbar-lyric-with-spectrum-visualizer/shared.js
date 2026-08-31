@@ -44,6 +44,7 @@ export const DEFAULT_SETTINGS = {
   lyricFilterEnabled: true,  // 是否启用歌词正则过滤
   lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹", // 过滤正则模式
   emptyText: "EchoMusic",   // 无歌词时显示的文本
+  hotkey: "Ctrl+Alt+I",      // 全局快捷键（Electron Accelerator 格式，如 Ctrl+Shift+L）
 };
 
 // ==================== 工具函数 ====================
@@ -89,5 +90,6 @@ export const normalizeSettings = (value) => {
     lyricFilterEnabled: source.lyricFilterEnabled ?? DEFAULT_SETTINGS.lyricFilterEnabled,
     lyricFilterPatterns: typeof source.lyricFilterPatterns === "string" ? source.lyricFilterPatterns : DEFAULT_SETTINGS.lyricFilterPatterns,
     emptyText: typeof source.emptyText === "string" ? source.emptyText : DEFAULT_SETTINGS.emptyText,
+    hotkey: typeof source.hotkey === "string" ? source.hotkey : DEFAULT_SETTINGS.hotkey,
   };
 };

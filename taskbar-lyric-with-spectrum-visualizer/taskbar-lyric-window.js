@@ -57,6 +57,7 @@ taskbarOffsetX: -100,
   lyricFilterEnabled: true,
   lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹",
   emptyText: "EchoMusic",
+  hotkey: "Ctrl+Alt+I",
 };
 
 // ==================== 工具函数 ====================
@@ -462,6 +463,7 @@ export function activateWindow(ctx) {
        * 刷新歌词进度
        */
       const tickLyric = () => {
+        if (!settings.enabled) return;
         const snap = snapshot.value;
         if (!snap) return;
         const lines = snap.lyric?.lines ?? [];
@@ -674,14 +676,34 @@ export function activateWindow(ctx) {
           });
       };
 
-      // 监听启用状态，动态启停绘制循环与快照查询
+      // ==================== 歌词时钟控制 ====================
+
+      /** 启动歌词刷新时钟（仅插件启用时有效） */
+      const startClock = () => {
+        if (!settings.enabled) return;
+        if (!clockTimer) {
+          clockTimer = setInterval(tickLyric, LYRIC_CLOCK_INTERVAL_MS);
+        }
+      };
+
+      /** 停止歌词刷新时钟 */
+      const stopClock = () => {
+        if (clockTimer) {
+          clearInterval(clockTimer);
+          clockTimer = null;
+        }
+      };
+
+      // 监听启用状态，动态启停绘制循环、快照查询与歌词刷新
       const stopWatchSpectrum = watch(
         () => settings.enabled,
         (enabled) => {
           if (enabled) {
             startSpectrumLoop();
+            startClock();
           } else {
             stopSpectrumLoop();
+            stopClock();
             latestSpectrumFrame = null;
             snapshotPolling = false;
             if (spectrumCtx && spectrumCanvas) {
@@ -955,7 +977,7 @@ export function activateWindow(ctx) {
         });
 
         // 3. 启动歌词刷新时钟
-        clockTimer = setInterval(tickLyric, LYRIC_CLOCK_INTERVAL_MS);
+        startClock();
 
         // 4. 从存储加载初始设置(仅作为 channel 尚未到达时的回退)
         if (!receivedFromChannel) {
@@ -1129,7 +1151,7 @@ export function activateWindow(ctx) {
         disarmWatchDog();
         document.removeEventListener('mousemove', onWatchDogMove);
         snapshotDispose?.();
-        if (clockTimer) clearInterval(clockTimer);
+        stopClock();
         if (settingsSyncTimer) clearInterval(settingsSyncTimer);
         if (keepaliveTimer) clearInterval(keepaliveTimer);
         channel?.close();
