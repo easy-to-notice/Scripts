@@ -13,17 +13,17 @@
 /** 存储键名，用于持久化设置 */
 const STORAGE_KEY = "settings";
 
-/** BroadcastChannel 频道名称，用于向浮窗同步设置与频谱帧 */
+/** BroadcastChannel 频道名称，用于向浮窗同步设置 */
 const CHANNEL_NAME = "echo-plugin:taskbar-lyric-spectrum:settings";
 
 /** 浮窗窗口 ID，用于窗口管理 API */
 const WINDOW_ID = "taskbar-lyric-spectrum";
 
-/** 频谱同步数据存储键（主入口采样主界面 spectrum-visualizer 的图层与 canvas，浮窗读取应用） */
-const SPECTRUM_SYNC_KEY = "spectrumSync";
+/** 频谱同步数据存储键（浮窗按需读取主窗口解析的主题色） */
+const SPECTRUM_PALETTE_SYNC_KEY = "spectrumPaletteSync";
 
-/** 频谱采样周期（毫秒）——颜色/透明度/填充跟随官方图层 */
-const SPECTRUM_SAMPLE_INTERVAL_MS = 1500;
+/** 主题色采样周期（毫秒）——单一 storage 同步方案：主入口读 CSS 变量 + 变更写入，浮窗快速轮询 */
+const SPECTRUM_PALETTE_SAMPLE_INTERVAL_MS = 50;
 
 /** 渲染帧率（固定 30 FPS） */
 const SPECTRUM_RENDER_FPS = 30;
@@ -52,10 +52,20 @@ const DEFAULT_SETTINGS = {
   showTranslation: true,
   showRomanization: false,
   secondaryScroll: false,
-  lyricFilterEnabled: true,
+  lyricFilterEnabled: false,
   lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹",
   emptyText: "EchoMusic",
   hotkey: "Ctrl+Alt+I",
+  showBackdrop: true,
+  spectrumFps: 30,
+  spectrumMode: "hybrid",
+  spectrumPalette: "theme",
+  spectrumFill: 84,
+  spectrumOpacity: 56,
+  mistIntensity: 78,
+  mistSoftness: 72,
+  mistMotion: 42,
+  centeredBarWidth: 2,
 };
 
 // ==================== 工具函数（与 shared.js 保持同步） ====================
@@ -102,6 +112,22 @@ const normalizeSettings = (value) => {
     lyricFilterPatterns: typeof source.lyricFilterPatterns === "string" ? source.lyricFilterPatterns : DEFAULT_SETTINGS.lyricFilterPatterns,
     emptyText: typeof source.emptyText === "string" ? source.emptyText : DEFAULT_SETTINGS.emptyText,
     hotkey: typeof source.hotkey === "string" ? source.hotkey : DEFAULT_SETTINGS.hotkey,
+    showBackdrop: source.showBackdrop ?? DEFAULT_SETTINGS.showBackdrop,
+    spectrumFps: [15, 24, 30].includes(Number(source.spectrumFps))
+      ? Number(source.spectrumFps)
+      : DEFAULT_SETTINGS.spectrumFps,
+    spectrumMode: ["bars", "wave", "hybrid", "mist", "centered"].includes(source.spectrumMode)
+      ? source.spectrumMode
+      : DEFAULT_SETTINGS.spectrumMode,
+    spectrumPalette: ["theme", "aurora", "ember", "ice", "mono"].includes(source.spectrumPalette)
+      ? source.spectrumPalette
+      : DEFAULT_SETTINGS.spectrumPalette,
+    spectrumFill: clamp(source.spectrumFill ?? DEFAULT_SETTINGS.spectrumFill, 35, 100),
+    spectrumOpacity: clamp(source.spectrumOpacity ?? DEFAULT_SETTINGS.spectrumOpacity, 18, 92),
+    mistIntensity: clamp(source.mistIntensity ?? DEFAULT_SETTINGS.mistIntensity, 35, 100),
+    mistSoftness: clamp(source.mistSoftness ?? DEFAULT_SETTINGS.mistSoftness, 20, 100),
+    mistMotion: clamp(source.mistMotion ?? DEFAULT_SETTINGS.mistMotion, 0, 100),
+    centeredBarWidth: clamp(source.centeredBarWidth ?? DEFAULT_SETTINGS.centeredBarWidth, 1, 8),
   };
 };
 
@@ -115,11 +141,17 @@ let heartbeatMissCount = 0;    // 连续丢失心跳计数
 let settingsDispose = null;    // 设置面板清理函数
 let windowRecoveryTimer = null; // 心跳恢复定时器（30s 检测窗口存活）
 let applyingRemoteSettings = false; // 防止设置同步循环
-let spectrumSampleTimer = null; // 频谱同步数据采样定时器（主窗口上下文采样 spectrum-visualizer 图层/canvas）
-let latestSpectrumColors = null; // 最近一次采样到的有效配色（canvas 不可用时保留旧值）
-let currentSpectrumOpacity = 0.4; // 最近读到的官方透明度
-let currentSpectrumFill = 70;     // 最近读到的官方填充率
-let spectrumBackdropState = false; // 最近读到的官方背景光晕开关
+let paletteSampleTimer = null;   // 主题色采样定时器（主窗口上下文读取 CSS 主题变量）
+let lastWrittenColors = null;    // 最近一次写入 storage 的三色（变更门控，避免无谓写入）
+
+/** 官方 spectrum-visualizer 的调色板（theme 由主窗口解析 CSS 变量） */
+const PALETTES = {
+  theme: ["#0071e3", "#5ac8fa", "#7c6cff"],
+  aurora: ["#42f5b3", "#35b7ff", "#a86dff"],
+  ember: ["#ffe08a", "#ff8f4a", "#ff4d7d"],
+  ice: ["#e9fbff", "#8ee7ff", "#6d8dff"],
+  mono: ["#f7fbff", "#b8c4d6", "#6b7280"],
+};
 
 /**
  * 通过 BroadcastChannel 广播设置到浮窗
@@ -149,180 +181,90 @@ const applySettings = async (ctx, values, options = {}) => {
   if (options.broadcast !== false) broadcastSettings();
 };
 
-// ==================== 频谱颜色采样 ====================
-
-/** 数值钳制 0-255 */
-const clampByte = (value) => Math.max(0, Math.min(255, Math.round(value || 0)));
-
-/** RGB → hex 颜色字符串 */
-const rgbToHex = (r, g, b) =>
-  `#${[clampByte(r), clampByte(g), clampByte(b)]
-    .map((v) => v.toString(16).padStart(2, "0"))
-    .join("")}`;
+// ==================== 主题色同步 ====================
 
 /**
- * 在主窗口 DOM 中查找 spectrum-visualizer 的频谱 canvas。
- * @returns {HTMLCanvasElement|null}
+ * 在主窗口上下文中解析 EchoMusic 主题三色（与官方 spectrum-visualizer 的
+ * resolvePaletteColors 一致，但作用于 document 根元素而非指定 host）。
+ * @returns {string[]|null} 三个 CSS 颜色，无法解析时返回 null
  */
-const findSpectrumCanvas = (ctx) => {
+const readThemeColors = () => {
   try {
-    const queryAll = ctx.dom?.queryAll || document.querySelectorAll.bind(document);
-    const canvases = queryAll(".echo-spectrum-canvas");
-    if (!canvases || canvases.length === 0) return null;
-    // 取面积最大的一个（优先展示明显的频谱区域）
-    let best = null;
-    for (const canvas of Array.from(canvases)) {
-      if (!(canvas instanceof HTMLCanvasElement)) continue;
-      const area = canvas.width * canvas.height;
-      if (!best || area > best.width * best.height) best = canvas;
+    if (
+      typeof window === "undefined" ||
+      typeof window.getComputedStyle !== "function" ||
+      !document.documentElement
+    ) {
+      return null;
     }
-    return best && best.width > 2 && best.height > 2 ? best : null;
+    const computed = window.getComputedStyle(document.documentElement);
+    const readColor = (...names) => {
+      for (const name of names) {
+        const value = computed.getPropertyValue(name).trim();
+        if (value && !value.includes("var(")) return value;
+      }
+      return "";
+    };
+    const primary =
+      readColor("--color-primary", "--color-primary-root") || "";
+    const secondary =
+      readColor("--color-secondary", "--color-primary-hover") || "";
+    const tertiary =
+      readColor("--color-primary-hover", "--color-primary-dark") || "";
+    if (!primary || !secondary || !tertiary) return null;
+    return [primary, secondary, tertiary];
   } catch {
     return null;
   }
 };
 
-/**
- * 采样 spectrum-visualizer 渲染的 canvas，还原其渐变三色。
- * spectrum-visualizer 使用 createLinearGradient(0, height, width, 0)，
- * 三个颜色 stop 位于 0 / 0.52 / 1。这里把像素按投影位置 t 分成三档求平均色。
- * @returns {string[]|null} 三个 hex 颜色，无法采样时返回 null
- */
-const sampleSpectrumColors = (ctx) => {
-  const canvas = findSpectrumCanvas(ctx);
-  if (!canvas) return null;
-  let context = null;
-  try {
-    context = canvas.getContext("2d");
-  } catch { /* 跨域/污染 canvas 拒绝 */ }
-  if (!context) return null;
-
-  let imageData = null;
-  try {
-    imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-  } catch {
-    return null;
-  }
-  const data = imageData.data;
-  const w = canvas.width;
-  const h = canvas.height;
-  const denom = w * w + h * h;
-
-  const sums = [
-    { r: 0, g: 0, b: 0, n: 0 },
-    { r: 0, g: 0, b: 0, n: 0 },
-    { r: 0, g: 0, b: 0, n: 0 },
-  ];
-
-  for (let y = 0; y < h; y += 2) {
-    for (let x = 0; x < w; x += 2) {
-      const index = (y * w + x) * 4;
-      const alpha = data[index + 3];
-      if (alpha < 40) continue;
-      // 像素在渐变线上的投影位置：(0,h) → (w,0)，t=0→stop0，t=1→stop2
-      const t = (x * w + (h - 1 - y) * h) / denom;
-      const bucket = t < 0.26 ? 0 : t < 0.78 ? 1 : 2;
-      sums[bucket].r += data[index];
-      sums[bucket].g += data[index + 1];
-      sums[bucket].b += data[index + 2];
-      sums[bucket].n += 1;
-    }
-  }
-
-  // 任一档像素不足则视为采样不完整（如暂停/低能量时），保留上一次值
-  if (sums[0].n < 12 || sums[1].n < 12 || sums[2].n < 12) return null;
-
-  return sums.map(({ r, g, b, n }) => rgbToHex(r / n, g / n, b / n));
-};
-
-/** 校验颜色数组是否为三个合法 hex 字符串 */
-const isValidSpectrumColors = (colors) =>
+/** 校验颜色数组是否为三个合法颜色字符串 */
+const isValidPaletteColors = (colors) =>
   Array.isArray(colors) &&
   colors.length === 3 &&
-  colors.every((c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c));
+  colors.every((c) => typeof c === "string" && c.length > 0);
 
 /**
- * 读取官方 spectrum-visualizer 图层暴露的样式参数。
- * 图层上由官方插件设置了 --echo-spectrum-opacity / --echo-spectrum-fill 两个 CSS 变量，
- * 以及 data-backdrop 背景光晕开关。
- * @returns {{ opacity: number, fill: number, backdrop: boolean }}
- */
-const readSpectrumLayerState = (ctx) => {
-  try {
-    const queryAll = ctx.dom?.queryAll || document.querySelectorAll.bind(document);
-    const layers = queryAll(".echo-spectrum-layer");
-    const layer = Array.from(layers || []).find((el) => el && el.style);
-    if (!layer) {
-      return {
-        opacity: currentSpectrumOpacity,
-        fill: currentSpectrumFill,
-        backdrop: spectrumBackdropState,
-      };
-    }
-    const opacity = parseFloat(layer.style.getPropertyValue("--echo-spectrum-opacity"));
-    const fill = parseFloat(layer.style.getPropertyValue("--echo-spectrum-fill"));
-    return {
-      opacity: Number.isFinite(opacity) ? opacity : currentSpectrumOpacity,
-      fill: Number.isFinite(fill) ? fill : currentSpectrumFill,
-      backdrop: layer.dataset?.backdrop === "true"
-        ? true
-        : layer.dataset?.backdrop === "false"
-          ? false
-          : spectrumBackdropState,
-    };
-  } catch {
-    return {
-      opacity: currentSpectrumOpacity,
-      fill: currentSpectrumFill,
-      backdrop: spectrumBackdropState,
-    };
-  }
-};
-
-/**
- * 汇总一次频谱同步数据并写入插件存储（浮窗通过 storage 轮询读取）。
- * 数据 = 实测配色 + 官方图层透明度/填充；渲染帧率固定 30 FPS。
+ * 当用户选择"跟随主程序"主题时，读取主窗口 CSS 主题变量并写入 storage，
+ * 浮窗快速轮询后应用。仅在颜色实际变化时写入（变更门控），平时零写入。
+ * 非 theme 主题时不读取、不写入。
  * @param {Object} ctx - 插件上下文
  */
-const syncSpectrumData = async (ctx) => {
+const syncThemeColors = async (ctx) => {
   try {
-    // 颜色：采样官方 canvas；失败时保留上次有效值
-    const colors = sampleSpectrumColors(ctx);
-    if (colors && isValidSpectrumColors(colors)) {
-      latestSpectrumColors = colors;
-    }
-    const { opacity, fill, backdrop } = readSpectrumLayerState(ctx);
-    currentSpectrumOpacity = opacity;
-    currentSpectrumFill = fill;
-    spectrumBackdropState = backdrop;
-    if (!latestSpectrumColors) return; // 从未采到有效配色 → 不写，浮窗沿用默认
-
-    await ctx.storage.set(SPECTRUM_SYNC_KEY, {
-      colors: latestSpectrumColors,
-      opacity,
-      fill,
-      backdrop,
+    if (state?.settings?.spectrumPalette !== "theme") return;
+    const colors = readThemeColors();
+    if (!colors || !isValidPaletteColors(colors)) return;
+    const changed = !lastWrittenColors
+      || colors[0] !== lastWrittenColors[0]
+      || colors[1] !== lastWrittenColors[1]
+      || colors[2] !== lastWrittenColors[2];
+    if (!changed) return;
+    lastWrittenColors = colors;
+    await ctx.storage.set(SPECTRUM_PALETTE_SYNC_KEY, {
+      colors,
       fps: SPECTRUM_RENDER_FPS,
     });
-  } catch { /* 采样失败静默忽略 */ }
+  } catch { /* 读取失败静默忽略 */ }
 };
 
-/** 启动频谱同步数据采样循环 */
-const startSpectrumSampleLoop = (ctx) => {
-  if (spectrumSampleTimer) return;
+/** 启动主题色同步循环 */
+const startPaletteSampleLoop = (ctx) => {
+  if (paletteSampleTimer) return;
   // 立即采样一次，之后周期性刷新
-  syncSpectrumData(ctx);
-  spectrumSampleTimer = setInterval(() => {
-    syncSpectrumData(ctx);
-  }, SPECTRUM_SAMPLE_INTERVAL_MS);
+  syncThemeColors(ctx);
+  paletteSampleTimer = setInterval(() => {
+    syncThemeColors(ctx);
+  }, SPECTRUM_PALETTE_SAMPLE_INTERVAL_MS);
 };
 
-/** 停止频谱同步数据采样循环 */
-const stopSpectrumSampleLoop = () => {
-  if (spectrumSampleTimer) {
-    clearInterval(spectrumSampleTimer);
-    spectrumSampleTimer = null;
+/** 停止主题色同步循环 */
+const stopPaletteSampleLoop = () => {
+  if (paletteSampleTimer) {
+    clearInterval(paletteSampleTimer);
+    paletteSampleTimer = null;
   }
+  lastWrittenColors = null;
 };
 
 /**
@@ -495,6 +437,7 @@ const createSettingsComponent = (ctx) =>
       const Input = defineAsyncComponent(ctx.ui.components.Input);
       const Slider = defineAsyncComponent(ctx.ui.components.Slider);
       const Switch = defineAsyncComponent(ctx.ui.components.Switch);
+      const Select = defineAsyncComponent(ctx.ui.components.Select);
       const Preview = createPreviewComponent(ctx);
       // 草稿设置（未保存的修改）
       const draft = reactive(normalizeSettings(state?.settings));
@@ -683,6 +626,18 @@ const createSettingsComponent = (ctx) =>
           }, opt.label)
         ));
 
+      // 渲染下拉选择字段
+      const renderSelectField = (key, label, options, hint = "") =>
+        h("label", { class: "tb-lyric-settings-field" }, [
+          h("span", { class: "tb-lyric-settings-label" }, label),
+          h(Select, {
+            modelValue: draft[key],
+            options,
+            class: "tb-lyric-settings-select",
+            "onUpdate:modelValue": (value) => setDraftValue(key, value),
+          }),
+        ]);
+
       // 渲染按钮
       const renderButton = (label, props = {}) =>
         h(Button, props, { default: () => label });
@@ -774,6 +729,43 @@ const createSettingsComponent = (ctx) =>
                 "onUpdate:modelValue": (value) => setDraftValue("taskbarOffsetY", Number(value)),
               }),
             ]),
+          ]),
+          // 频谱设置
+          renderSection("频谱", "独立于频谱可视化插件的频谱参数（浮窗自行渲染）。频段数量、FFT 精度、平滑度、频率分布由频谱可视化插件决定，浮窗自动跟随。", [
+            renderSwitchRow("showBackdrop", "背景光晕", "增加一层低对比度渐变底色"),
+            renderSelectField("spectrumMode", "频谱样式", [
+              { label: "雾状", value: "mist" },
+              { label: "中心频谱", value: "centered" },
+              { label: "混合", value: "hybrid" },
+              { label: "柱状", value: "bars" },
+              { label: "波形", value: "wave" },
+            ], "切换频谱的绘制语言"),
+            renderSelectField("spectrumPalette", "色彩主题", [
+              { label: "跟随主程序", value: "theme" },
+              { label: "极光", value: "aurora" },
+              { label: "余烬", value: "ember" },
+              { label: "冰蓝", value: "ice" },
+              { label: "单色", value: "mono" },
+            ], "应用到频谱与背景光晕"),
+            renderSliderField("spectrumOpacity", "不透明度", { min: 18, max: 92, suffix: "%" }),
+            renderSliderField("spectrumFill", "填充高度", { min: 35, max: 100, suffix: "%" }),
+            draft.spectrumMode === "mist"
+              ? renderSliderField("mistIntensity", "雾气浓度", { min: 35, max: 100, suffix: "%" })
+              : null,
+            draft.spectrumMode === "mist"
+              ? renderSliderField("mistSoftness", "雾化柔度", { min: 20, max: 100, suffix: "%" })
+              : null,
+            draft.spectrumMode === "mist"
+              ? renderSliderField("mistMotion", "流动速度", { min: 0, max: 100, suffix: "%" })
+              : null,
+            draft.spectrumMode === "centered"
+              ? renderSliderField("centeredBarWidth", "频谱条宽度", { min: 1, max: 8, suffix: "px" })
+              : null,
+            renderSelectField("spectrumFps", "渲染帧率", [
+              { label: "15 FPS · 节能", value: 15 },
+              { label: "24 FPS · 平衡", value: 24 },
+              { label: "30 FPS · 流畅", value: 30 },
+            ], "雾状模式最高按 24 FPS 绘制"),
           ]),
           // 底部按钮
           h("div", { class: "tb-lyric-settings-footer" }, [
@@ -939,6 +931,12 @@ export async function activate(ctx) {
 .tb-lyric-settings-slider {
   width: 100%;
   min-width: 0;
+}
+
+.tb-lyric-settings-select {
+  width: 100%;
+  min-width: 0;
+  justify-content: space-between;
 }
 
 /* 单选按钮组 */
@@ -1285,12 +1283,10 @@ export async function activate(ctx) {
     } catch { /* 忽略轮询错误 */ }
   }, 1000);
 
-  // 频谱同步数据采样：主窗口上下文周期性采样 spectrum-visualizer 的 canvas 与图层，
-  // 把配色/透明度/填充写入本插件存储，浮窗轮询后应用（跨窗口走 storage，不依赖 BroadcastChannel）。
-  // 渲染帧率固定 30 FPS，见 SPECTRUM_RENDER_FPS。
-  startSpectrumSampleLoop(ctx);
+  // 主题色同步：主入口读取 CSS 变量，变更时写入 storage，浮窗 50ms 轮询应用
+  startPaletteSampleLoop(ctx);
   ctx.dispose(() => {
-    stopSpectrumSampleLoop();
+    stopPaletteSampleLoop();
   });
 }
 
@@ -1300,7 +1296,7 @@ export async function activate(ctx) {
  */
 export function deactivate(ctx) {
   hideWindow(ctx);
-  stopSpectrumSampleLoop();
+  stopPaletteSampleLoop();
   if (windowRecoveryTimer) { clearInterval(windowRecoveryTimer); windowRecoveryTimer = null; }
   channel?.close();
   channel = null;

@@ -9,7 +9,7 @@
 
 // ==================== 内联常量(与 shared.js 保持一致) ====================
 
-/** BroadcastChannel 频道名称,用于接收主插件的设置同步与频谱帧 */
+/** BroadcastChannel 频道名称,用于接收主插件的设置同步 */
 const CHANNEL_NAME = "echo-plugin:taskbar-lyric-spectrum:settings";
 
 /** 歌词刷新间隔(毫秒), 33ms ≈30fps */
@@ -21,20 +21,26 @@ const LYRIC_LOOKAHEAD_MS = 150;
 /** 默认任务栏高度(后备值) */
 const TASKBAR_FALLBACK_HEIGHT = 48;
 
-/** 频谱同步数据存储键（由主入口 index.js 采样官方插件写入，浮窗轮询读取应用） */
-const SPECTRUM_SYNC_KEY = "spectrumSync";
+/** 主题色同步数据存储键（主入口 index.js 解析主窗口 CSS 主题变量写入，浮窗轮询读取） */
+const SPECTRUM_PALETTE_SYNC_KEY = "spectrumPaletteSync";
 
-/** 频谱同步数据轮询间隔(毫秒)，跟随主入口采样的更新节奏 */
-const SPECTRUM_COLORS_INTERVAL_MS = 2000;
+/** 主题色同步数据轮询间隔(毫秒) */
+const SPECTRUM_PALETTE_SYNC_INTERVAL_MS = 50; // 主题色 storage 轮询（主入口变更写入，双端 50ms）
 
-/** 频谱渲染帧率（固定 30 FPS） */
+/** 频谱渲染帧率上限（雾状模式最高 24，混合最高 30） */
 const SPECTRUM_RENDER_FPS = 30;
 
-/** 频谱绘制参数（运行时由主入口采样的 spectrum-visualizer 真实配色/参数更新，初始沿用原配置） */
-let spectrumColors = ["#42f5b3", "#35b7ff", "#a86dff"];
-let spectrumOpacity = 0.4;   // 官方透明度（浮窗 canvas 样式跟随）
-let spectrumFill = 70;       // 官方填充率（浮窗绘制高度跟随）
-let spectrumBackdrop = false; // 官方背景光晕开关
+/** 官方 spectrum-visualizer 的调色板（theme 由主窗口解析 CSS 变量） */
+const PALETTES = {
+  theme: ["#0071e3", "#5ac8fa", "#7c6cff"],
+  aurora: ["#42f5b3", "#35b7ff", "#a86dff"],
+  ember: ["#ffe08a", "#ff8f4a", "#ff4d7d"],
+  ice: ["#e9fbff", "#8ee7ff", "#6d8dff"],
+  mono: ["#f7fbff", "#b8c4d6", "#6b7280"],
+};
+
+/** 最近一次解析到的主题三色（"跟随主程序"调色板使用，浮窗轮询 storage 更新） */
+let themePaletteColors = null;
 
 /** 默认设置(与 shared.js DEFAULT_SETTINGS 同步) */
 const DEFAULT_SETTINGS = {
@@ -60,10 +66,20 @@ taskbarOffsetX: -100,
   showTranslation: true,
   showRomanization: false,
   secondaryScroll: false,
-  lyricFilterEnabled: true,
-  lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹",
+  lyricFilterEnabled: false,
+  lyricFilterPatterns: "作词|作曲|编曲|制作人|混音|母带|录音|和声|监制|出品|发行|版权|OP|SP|企划|统筹|词：|曲：",
   emptyText: "EchoMusic",
   hotkey: "Ctrl+Alt+I",
+  showBackdrop: true,
+  spectrumFps: 30,
+  spectrumMode: "hybrid",
+  spectrumPalette: "theme",
+  spectrumFill: 84,
+  spectrumOpacity: 56,
+  mistIntensity: 78,
+  mistSoftness: 72,
+  mistMotion: 42,
+  centeredBarWidth: 2,
 };
 
 // ==================== 工具函数 ====================
@@ -89,9 +105,17 @@ const appendRoundRect = (context, x, y, width, height, radius) => {
 
 // ==================== 频谱绘制 ====================
 
-/** 生成渐变（使用运行时频谱调色板） */
-const makeSpectrumGradient = (context, width, height) => {
-  const colors = spectrumColors;
+/** 解析当前调色板三色（theme 用主窗口采样的主题色，其余用内置 PALETTES） */
+const getPaletteColors = (settings) => {
+  if (settings?.spectrumPalette === "theme") {
+    if (themePaletteColors && themePaletteColors.length === 3) return themePaletteColors;
+    return PALETTES.theme;
+  }
+  return PALETTES[settings?.spectrumPalette] || PALETTES.theme;
+};
+
+/** 生成渐变（使用当前调色板） */
+const makeSpectrumGradient = (context, width, height, colors) => {
   const gradient = context.createLinearGradient(0, height, width, 0);
   gradient.addColorStop(0, colors[0]);
   gradient.addColorStop(0.52, colors[1]);
@@ -100,29 +124,29 @@ const makeSpectrumGradient = (context, width, height) => {
 };
 
 /** 绘制背景光晕（与 spectrum-visualizer 的 drawBackdrop 一致：整画布渐变，少量能量响应） */
-const drawSpectrumBackdrop = (context, width, height, frame) => {
+const drawSpectrumBackdrop = (context, width, height, frame, colors) => {
   const energy = clamp(frame?.rms ?? 0, 0, 1);
   context.save();
   context.globalAlpha = 0.18 + energy * 0.14;
   const gradient = context.createLinearGradient(0, 0, width, height);
-  gradient.addColorStop(0, spectrumColors[0]);
+  gradient.addColorStop(0, colors[0]);
   gradient.addColorStop(0.5, "rgba(10, 15, 28, 0.12)");
-  gradient.addColorStop(1, spectrumColors[2]);
+  gradient.addColorStop(1, colors[2]);
   context.fillStyle = gradient;
   context.fillRect(0, 0, width, height);
   context.restore();
 };
 
 /** 绘制柱状频谱（底部锚定） */
-const drawSpectrumBars = (context, width, height, frame) => {
+const drawSpectrumBars = (context, width, height, frame, fill, colors) => {
   const bins = frame?.bins || [];
   const count = Math.max(1, bins.length);
   const bottom = height - 1;
-  const top = Math.max(4, height - height * (spectrumFill / 100));
+  const top = Math.max(4, height - height * (fill / 100));
   const slot = width / count;
   const gap = Math.max(1, Math.min(3, slot * 0.22));
   const radius = Math.min(3, Math.max(1.5, slot * 0.22));
-  const gradient = makeSpectrumGradient(context, width, height);
+  const gradient = makeSpectrumGradient(context, width, height, colors);
 
   context.save();
   context.shadowColor = "rgba(80, 220, 255, 0.14)";
@@ -167,20 +191,20 @@ const getSpectrumWaveform = (frame) => {
 };
 
 /** 绘制波形线（与 spectrum-visualizer 的 drawWave 一致：中心线 + 渐变描边 + 光晕） */
-const drawSpectrumWave = (context, width, height, frame) => {
+const drawSpectrumWave = (context, width, height, frame, fill, colors) => {
   const waveform = getSpectrumWaveform(frame);
   if (waveform.length < 2) return;
   const center = height * 0.5;
-  const amplitude = height * 0.25 * (spectrumFill / 100);
+  const amplitude = height * 0.25 * (fill / 100);
 
   context.save();
   context.globalAlpha = 0.38;
   context.lineWidth = 2;
   context.lineJoin = "round";
   context.lineCap = "round";
-  context.shadowColor = spectrumColors[1];
+  context.shadowColor = colors[1];
   context.shadowBlur = 16;
-  context.strokeStyle = makeSpectrumGradient(context, width, height);
+  context.strokeStyle = makeSpectrumGradient(context, width, height, colors);
   context.beginPath();
   waveform.forEach((sample, index) => {
     const x = (index / Math.max(1, waveform.length - 1)) * width;
@@ -193,9 +217,259 @@ const drawSpectrumWave = (context, width, height, frame) => {
 };
 
 /** 混合样式：先波形线后柱状（与 spectrum-visualizer 的 hybrid 一致） */
-const drawSpectrumHybrid = (context, width, height, frame) => {
-  drawSpectrumWave(context, width, height, frame);
-  drawSpectrumBars(context, width, height, frame);
+const drawSpectrumHybrid = (context, width, height, frame, fill, colors) => {
+  drawSpectrumWave(context, width, height, frame, fill, colors);
+  drawSpectrumBars(context, width, height, frame, fill, colors);
+};
+
+// ==================== 雾状频谱 ====================
+
+/** 从频段数据构建雾状轮廓（与 spectrum-visualizer 的 buildMistProfile 一致） */
+const buildMistProfile = (bins, pointCount = 28) => {
+  const count = Math.round(clamp(pointCount, 8, 64));
+  const source = Array.from(bins || [], (value) => clamp(value, 0, 1));
+  if (!source.length) return Array.from({ length: count }, () => 0);
+
+  const profile = Array.from({ length: count }, (_, index) => {
+    const center = (index / Math.max(1, count - 1)) * (source.length - 1);
+    const radius = Math.max(1, (source.length / count) * 1.8);
+    const from = Math.max(0, Math.floor(center - radius));
+    const to = Math.min(source.length - 1, Math.ceil(center + radius));
+    let weighted = 0;
+    let weightTotal = 0;
+
+    for (let sourceIndex = from; sourceIndex <= to; sourceIndex += 1) {
+      const distance = Math.abs(sourceIndex - center) / radius;
+      const weight = Math.max(0, 1 - distance * 0.72);
+      weighted += source[sourceIndex] * weight;
+      weightTotal += weight;
+    }
+
+    return Math.pow(weighted / Math.max(weightTotal, 1), 0.78);
+  });
+
+  return profile.map((value, index) => {
+    const previous = profile[Math.max(0, index - 1)];
+    const next = profile[Math.min(profile.length - 1, index + 1)];
+    return clamp(previous * 0.2 + value * 0.6 + next * 0.2, 0, 1);
+  });
+};
+
+/** 追加雾状路径（与 spectrum-visualizer 的 appendMistPath 一致） */
+const appendMistPath = (
+  context,
+  profile,
+  width,
+  baseline,
+  fillHeight,
+  layer,
+  phase,
+  motion,
+  idle,
+) => {
+  const padding = Math.max(18, width * 0.035);
+  const span = width + padding * 2;
+  const points = profile.map((value, index) => {
+    const progress = index / Math.max(1, profile.length - 1);
+    const x = -padding + progress * span;
+    const drift =
+      Math.sin(
+        progress * Math.PI * (2.4 + layer.index * 0.35) + phase + layer.phase,
+      ) *
+      (0.018 + motion * 0.035);
+    const ambient = idle ? 0.075 : 0.025;
+    const level = ambient + value * layer.scale + drift;
+    return { x, y: baseline - fillHeight * clamp(level, 0.02, 1) };
+  });
+
+  context.beginPath();
+  context.moveTo(-padding, baseline + padding);
+  context.lineTo(points[0].x, points[0].y);
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const point = points[index];
+    const midpointX = (previous.x + point.x) * 0.5;
+    const midpointY = (previous.y + point.y) * 0.5;
+    context.quadraticCurveTo(previous.x, previous.y, midpointX, midpointY);
+  }
+  const last = points[points.length - 1];
+  context.quadraticCurveTo(last.x, last.y, width + padding, last.y);
+  context.lineTo(width + padding, baseline + padding);
+  context.closePath();
+};
+
+/** 计算雾状渲染分层参数（与 spectrum-visualizer 的 getMistRenderLayers 一致） */
+const getMistRenderLayers = (settings, energy = 0) => {
+  const intensity = clamp(settings.mistIntensity ?? 78, 35, 100) / 100;
+  const softness = clamp(settings.mistSoftness ?? 72, 20, 100) / 100;
+  const signal = clamp(energy, 0, 1);
+  return [
+    { index: 0, scale: 0.58, alpha: 0.48, phase: 0.3, blur: 1.05 },
+    { index: 1, scale: 0.78, alpha: 0.36, phase: 2.2, blur: 0.72 },
+    { index: 2, scale: 0.98, alpha: 0.28, phase: 4.4, blur: 0.42 },
+  ].map((layer) => ({
+    ...layer,
+    alpha: (layer.alpha + signal * 0.12) * intensity,
+    blur: Math.round((3 + softness * 11) * layer.blur),
+  }));
+};
+
+/** 绘制雾状频谱（锚定底部，与 spectrum-visualizer 的 drawMist 一致） */
+const drawSpectrumMist = (context, width, height, frame, settings, time, idle, colors) => {
+  const pointCount = Math.round(clamp(width / 18, 18, 44));
+  const profile = buildMistProfile(idle ? [] : frame?.bins, pointCount);
+  const energy = clamp(frame?.rms ?? 0, 0, 1);
+  const fillHeight = height * ((settings.spectrumFill ?? 84) / 100);
+  const baseline = height + 2;
+  const reduceMotion = window.matchMedia?.(
+    "(prefers-reduced-motion: reduce)",
+  )?.matches;
+  const motion = reduceMotion ? 0 : (settings.mistMotion ?? 42) / 100;
+  const phase = (time / 1000) * motion * 0.9;
+  const layers = getMistRenderLayers(settings, energy);
+
+  context.save();
+  context.globalCompositeOperation = "screen";
+  for (const layer of layers) {
+    const gradient = context.createLinearGradient(0, baseline, width, 0);
+    gradient.addColorStop(0, colors[layer.index % colors.length]);
+    gradient.addColorStop(0.5, colors[(layer.index + 1) % colors.length]);
+    gradient.addColorStop(1, colors[(layer.index + 2) % colors.length]);
+    context.save();
+    context.globalAlpha = layer.alpha;
+    context.filter = `blur(${layer.blur}px)`;
+    context.fillStyle = gradient;
+    appendMistPath(
+      context,
+      profile,
+      width,
+      baseline,
+      fillHeight,
+      layer,
+      phase,
+      motion,
+      idle,
+    );
+    context.fill();
+    context.restore();
+  }
+  context.restore();
+};
+
+// ==================== 中心频谱 ====================
+
+/** 构建中心镜像轮廓（与 spectrum-visualizer 的 buildCenteredProfile 一致） */
+const buildCenteredProfile = (bins, barCount) => {
+  const count = Math.round(clamp(barCount, 2, 512));
+  const source = Array.from(bins || [], (value) => clamp(value, 0, 1));
+  if (!source.length) return Array.from({ length: count }, () => 0);
+
+  const sampleAt = (position) => {
+    const bounded = clamp(position, 0, source.length - 1);
+    const lower = Math.floor(bounded);
+    const upper = Math.min(source.length - 1, lower + 1);
+    const fraction = bounded - lower;
+    return source[lower] + (source[upper] - source[lower]) * fraction;
+  };
+
+  return Array.from({ length: count }, (_, index) => {
+    const progress = index / Math.max(1, count - 1);
+    const frequencyPosition = Math.abs(progress * 2 - 1) * (source.length - 1);
+    return clamp(
+      (sampleAt(frequencyPosition - 0.65) +
+        sampleAt(frequencyPosition) * 2 +
+        sampleAt(frequencyPosition + 0.65)) /
+        4,
+      0,
+      1,
+    );
+  });
+};
+
+/** 计算中心频谱条布局（与 spectrum-visualizer 的 getCenteredBarLayout 一致） */
+const getCenteredBarLayout = (width, requestedBarWidth = 2, gap = 3) => {
+  const barWidth = clamp(requestedBarWidth, 1, 8);
+  const safeGap = clamp(gap, 1, 8);
+  const count = Math.min(
+    512,
+    Math.max(2, Math.floor(Math.max(0, width) / (barWidth + safeGap))),
+  );
+  const slotWidth = Math.max(0, width) / count;
+  return {
+    count,
+    slotWidth,
+    barWidth: Math.min(barWidth, Math.max(1, slotWidth - 1)),
+  };
+};
+
+/** 平滑更新中心频谱显示值（与 spectrum-visualizer 的 updateCenteredDisplay 一致） */
+const updateCenteredDisplay = (previous, target, attack = 0.4, decay = 0.88) =>
+  target.map((value, index) => {
+    const current = clamp(previous?.[index] ?? 0, 0, 1);
+    return value > current
+      ? current + (value - current) * attack
+      : current * decay + value * (1 - decay);
+  });
+
+/** 绘制中心镜像频谱（与 spectrum-visualizer 的 drawCentered 一致，全局显示值状态） */
+const drawSpectrumCentered = (context, width, height, frame, settings, display, colors) => {
+  const { count, slotWidth, barWidth } = getCenteredBarLayout(
+    width,
+    settings.centeredBarWidth ?? 2,
+  );
+  const target = buildCenteredProfile(frame?.bins, count);
+  const nextDisplay = updateCenteredDisplay(display, target);
+  display.length = 0;
+  display.push(...nextDisplay);
+
+  const bottom = height - 2;
+  const fillHeight = height * ((settings.spectrumFill ?? 84) / 100);
+
+  context.save();
+  context.globalAlpha = 0.65;
+  context.fillStyle = colors[0];
+  context.beginPath();
+  for (let index = 0; index < count; index += 1) {
+    const barHeight = nextDisplay[index] * fillHeight;
+    if (barHeight <= 0.5) continue;
+    const x = index * slotWidth + (slotWidth - barWidth) * 0.5;
+    appendRoundRect(
+      context,
+      x,
+      bottom - barHeight,
+      barWidth,
+      barHeight,
+      2,
+    );
+  }
+  context.fill();
+  context.restore();
+  return nextDisplay;
+};
+
+/** 绘制待机波形（无真实音频数据时，细微上下波动） */
+const drawSpectrumIdle = (context, width, height, settings, time, colors) => {
+  const count = 48;
+  const slot = width / count;
+  context.save();
+  context.globalAlpha = 0.2;
+  context.fillStyle = colors[1];
+  context.beginPath();
+  for (let index = 0; index < count; index += 1) {
+    const wave = 0.5 + 0.5 * Math.sin(time / 700 + index * 0.36);
+    const barHeight = 2 + wave * 7;
+    const x = index * slot + slot * 0.22;
+    appendRoundRect(
+      context,
+      x,
+      height - 10 - barHeight,
+      slot * 0.56,
+      barHeight,
+      2,
+    );
+  }
+  context.fill();
+  context.restore();
 };
 
 // ==================== 任务栏定位 ====================
@@ -461,7 +735,7 @@ export function activateWindow(ctx) {
       let receivedFromChannel = false; // 防止竞态:标记是否已从 channel 收到设置
       let settingsSyncTimer = null;    // storage 轮询定时器(BroadcastChannel 后备)
       let lastSettingsHash = "";       // 上次轮询到的设置 hash,避免重复更新
-      let colorsSyncTimer = null;      // 频谱颜色轮询定时器(读取主入口采样结果)
+      let paletteSyncTimer = null;     // 主题色轮询定时器(读取主入口解析的主窗口主题色)
 
       // ============ 频谱状态 ============
       let latestSpectrumFrame = null;  // 最近一次可用的频谱帧（独立 getSnapshot 轮询获取）
@@ -469,7 +743,8 @@ export function activateWindow(ctx) {
       let spectrumCtx = null;          // canvas 2d context
       let spectrumRaf = 0;             // requestAnimationFrame id
       let spectrumLastDraw = 0;        // 上次绘制时间戳
-      let spectrumRenderFps = SPECTRUM_RENDER_FPS; // 频谱渲染帧率（固定 30）
+      let spectrumRenderFps = SPECTRUM_RENDER_FPS; // 频谱渲染帧率（根据模式上限）
+      let spectrumCenteredDisplay = []; // 中心频谱平滑显示值（跨帧保留）
       let snapshotPolling = false;     // getSnapshot 轮询防重入（异步 IPC 未返回时跳过下一拍）
       let snapshotLastAt = 0;          // 上次快照轮询时间戳
       let snapshotLogged = false;      // 诊断：是否已打印首帧信息
@@ -521,7 +796,8 @@ export function activateWindow(ctx) {
       /**
        * 设置 BroadcastChannel 监听
        * 接收来自主插件(index.js)的设置同步。频谱不再经此转发：
-       * 浮窗自行轮询 getSnapshot()（独立频谱查询）。
+       * 浮窗自行轮询 getSnapshot()（独立频谱查询）。主题色同样不走 channel，
+       * 统一由 storage 快速轮询同步。
        */
       const setupChannel = () => {
         if (typeof BroadcastChannel !== "function") return;
@@ -537,33 +813,21 @@ export function activateWindow(ctx) {
         };
       };
 
-      /** 校验颜色数组是否为三个合法 hex 字符串 */
-      const isValidSpectrumColors = (colors) =>
-        Array.isArray(colors) &&
-        colors.length === 3 &&
-        colors.every((c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c));
-
       /**
-       * 从本插件存储读取主入口( index.js )采样的 spectrum-visualizer 同步数据，
-       * 应用到浮窗频谱（颜色/透明度/填充；渲染帧率固定 30 FPS）。主入口周期性
-       * 采样其图层与 canvas 并写入同一存储，因此这里不依赖跨窗口 BroadcastChannel。
-       * 渲染样式固定为混合样式（波形线 + 柱状），不跟随官方模式切换。
+       * 从本插件存储读取主入口( index.js )解析的 EchoMusic 主窗口主题三色，
+       * 仅供"跟随主程序"调色板使用。非 theme 调色板时跳过，减少无谓 IPC。
        */
-      const applySpectrumSync = async () => {
+      const applyPaletteSync = async () => {
+        if (settings?.spectrumPalette !== "theme") return;
         try {
-          const data = await ctx.storage.get(SPECTRUM_SYNC_KEY);
+          const data = await ctx.storage.get(SPECTRUM_PALETTE_SYNC_KEY);
           if (!data || typeof data !== "object") return;
-          if (isValidSpectrumColors(data.colors)) {
-            spectrumColors = data.colors;
-          }
-          if (typeof data.opacity === "number" && data.opacity >= 0 && data.opacity <= 1) {
-            spectrumOpacity = data.opacity;
-          }
-          if (typeof data.fill === "number" && data.fill > 0 && data.fill <= 100) {
-            spectrumFill = data.fill;
-          }
-          if (typeof data.backdrop === "boolean") {
-            spectrumBackdrop = data.backdrop;
+          if (
+            Array.isArray(data.colors) &&
+            data.colors.length === 3 &&
+            data.colors.every((c) => typeof c === "string" && c.length > 0)
+          ) {
+            themePaletteColors = data.colors;
           }
         } catch { /* 静默忽略 */ }
       };
@@ -704,6 +968,16 @@ export function activateWindow(ctx) {
       /** 频谱绘制主循环 */
       const drawSpectrumLoop = (time) => {
         spectrumRaf = requestAnimationFrame(drawSpectrumLoop);
+        // 渲染帧率根据模式限制（雾状最高 24，混合最高 30，其余取用户设置）
+        const mode = settings.spectrumMode || "hybrid";
+        const baseFps = [15, 24, 30].includes(Number(settings.spectrumFps))
+          ? Number(settings.spectrumFps)
+          : 30;
+        spectrumRenderFps = mode === "mist"
+          ? Math.min(baseFps, 24)
+          : mode === "hybrid"
+            ? Math.min(baseFps, 30)
+            : baseFps;
         const interval = 1000 / Math.max(10, spectrumRenderFps);
         if (time - spectrumLastDraw < interval) return;
         spectrumLastDraw = time;
@@ -738,18 +1012,34 @@ export function activateWindow(ctx) {
 
         context.clearRect(0, 0, logicalWidth, logicalHeight);
         const frame = latestSpectrumFrame;
-        // 背景光晕跟随官方开关（与官方一致：无论是否播放，开关开启时都绘制）
-        if (spectrumBackdrop) {
-          drawSpectrumBackdrop(context, logicalWidth, logicalHeight, frame);
+        const fill = settings.spectrumFill ?? 84;
+        const colors = getPaletteColors(settings);
+        // 背景光晕（与官方一致：无论是否播放，开关开启时都绘制）
+        if (settings.showBackdrop) {
+          drawSpectrumBackdrop(context, logicalWidth, logicalHeight, frame, colors);
         }
-        // 无真实频谱数据时不绘制频谱内容
+        // 有真实频谱数据时按模式绘制；否则 mist 画 idle mist、非 centered 画待机波形
         if (frame && frame.state !== "idle") {
-          drawSpectrumHybrid(context, logicalWidth, logicalHeight, frame);
+          if (mode === "mist") {
+            drawSpectrumMist(context, logicalWidth, logicalHeight, frame, settings, time, false, colors);
+          } else if (mode === "centered") {
+            drawSpectrumCentered(context, logicalWidth, logicalHeight, frame, settings, spectrumCenteredDisplay, colors);
+          } else if (mode === "wave") {
+            drawSpectrumWave(context, logicalWidth, logicalHeight, frame, fill, colors);
+          } else if (mode === "hybrid") {
+            drawSpectrumHybrid(context, logicalWidth, logicalHeight, frame, fill, colors);
+          } else {
+            drawSpectrumBars(context, logicalWidth, logicalHeight, frame, fill, colors);
+          }
+        } else if (mode === "mist") {
+          drawSpectrumMist(context, logicalWidth, logicalHeight, frame, settings, time, true, colors);
+        } else if (mode !== "centered") {
+          drawSpectrumIdle(context, logicalWidth, logicalHeight, settings, time, colors);
         }
-        // 透明度跟随官方图层（canvas 内联样式）
-        canvas.style.opacity = String(spectrumOpacity);
+        // 透明度（canvas 内联样式）
+        canvas.style.opacity = String((settings.spectrumOpacity ?? 56) / 100);
         // 背景光晕的暗色渐变（等效官方 CSS 规则）
-        canvas.style.background = spectrumBackdrop
+        canvas.style.background = settings.showBackdrop
           ? "linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.1) 100%)"
           : "transparent";
       };
@@ -1087,9 +1377,9 @@ export function activateWindow(ctx) {
         // 1. 先建立 BroadcastChannel 监听(防止竞态)
         setupChannel();
 
-        // 1b. 读取主入口采样的 spectrum-visualizer 频谱配色并轮询（跨窗口走 storage）
-        colorsSyncTimer = setInterval(() => { applySpectrumSync(); }, SPECTRUM_COLORS_INTERVAL_MS);
-        await applySpectrumSync();
+        // 1b. 快速轮询主入口写入的主题色（单一 storage 同步方案，双端 50ms）
+        paletteSyncTimer = setInterval(() => { applyPaletteSync(); }, SPECTRUM_PALETTE_SYNC_INTERVAL_MS);
+        await applyPaletteSync();
 
         // 2. 获取当前播放快照
         snapshot.value = await ctx.nowPlaying.getSnapshot();
@@ -1275,7 +1565,7 @@ export function activateWindow(ctx) {
         snapshotDispose?.();
         stopClock();
         if (settingsSyncTimer) clearInterval(settingsSyncTimer);
-        if (colorsSyncTimer) clearInterval(colorsSyncTimer);
+        if (paletteSyncTimer) clearInterval(paletteSyncTimer);
         if (keepaliveTimer) clearInterval(keepaliveTimer);
         channel?.close();
       });
@@ -1343,7 +1633,7 @@ export function activateWindow(ctx) {
         // 频谱画布（置于底层）
         const spectrumElement = h("canvas", {
           class: "tb-lyric-spectrum",
-          style: { opacity: spectrumOpacity },
+          style: { opacity: (settings.spectrumOpacity ?? 56) / 100 },
           ref: (el) => { spectrumCanvas = el; },
         });
 
