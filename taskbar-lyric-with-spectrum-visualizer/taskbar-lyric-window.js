@@ -21,14 +21,20 @@ const LYRIC_LOOKAHEAD_MS = 150;
 /** 默认任务栏高度(后备值) */
 const TASKBAR_FALLBACK_HEIGHT = 48;
 
-/** 频谱查询节奏固定参数（跟随共享分析器的设置，本插件不暴露频谱设置） */
-const SPECTRUM_DRAW = {
-  mode: "bars",
-  palette: ["#42f5b3", "#35b7ff", "#a86dff"],
-  opacity: 0.4,
-  fill: 70,
-  fps: 15,
-};
+/** 频谱同步数据存储键（由主入口 index.js 采样官方插件写入，浮窗轮询读取应用） */
+const SPECTRUM_SYNC_KEY = "spectrumSync";
+
+/** 频谱同步数据轮询间隔(毫秒)，跟随主入口采样的更新节奏 */
+const SPECTRUM_COLORS_INTERVAL_MS = 2000;
+
+/** 频谱渲染帧率（固定 30 FPS） */
+const SPECTRUM_RENDER_FPS = 30;
+
+/** 频谱绘制参数（运行时由主入口采样的 spectrum-visualizer 真实配色/参数更新，初始沿用原配置） */
+let spectrumColors = ["#42f5b3", "#35b7ff", "#a86dff"];
+let spectrumOpacity = 0.4;   // 官方透明度（浮窗 canvas 样式跟随）
+let spectrumFill = 70;       // 官方填充率（浮窗绘制高度跟随）
+let spectrumBackdrop = false; // 官方背景光晕开关
 
 /** 默认设置(与 shared.js DEFAULT_SETTINGS 同步) */
 const DEFAULT_SETTINGS = {
@@ -83,9 +89,9 @@ const appendRoundRect = (context, x, y, width, height, radius) => {
 
 // ==================== 频谱绘制 ====================
 
-/** 生成渐变（固定配色） */
+/** 生成渐变（使用运行时频谱调色板） */
 const makeSpectrumGradient = (context, width, height) => {
-  const colors = SPECTRUM_DRAW.palette;
+  const colors = spectrumColors;
   const gradient = context.createLinearGradient(0, height, width, 0);
   gradient.addColorStop(0, colors[0]);
   gradient.addColorStop(0.52, colors[1]);
@@ -93,20 +99,34 @@ const makeSpectrumGradient = (context, width, height) => {
   return gradient;
 };
 
+/** 绘制背景光晕（与 spectrum-visualizer 的 drawBackdrop 一致：整画布渐变，少量能量响应） */
+const drawSpectrumBackdrop = (context, width, height, frame) => {
+  const energy = clamp(frame?.rms ?? 0, 0, 1);
+  context.save();
+  context.globalAlpha = 0.18 + energy * 0.14;
+  const gradient = context.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, spectrumColors[0]);
+  gradient.addColorStop(0.5, "rgba(10, 15, 28, 0.12)");
+  gradient.addColorStop(1, spectrumColors[2]);
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, width, height);
+  context.restore();
+};
+
 /** 绘制柱状频谱（底部锚定） */
 const drawSpectrumBars = (context, width, height, frame) => {
   const bins = frame?.bins || [];
   const count = Math.max(1, bins.length);
   const bottom = height - 1;
-  const top = Math.max(4, height - height * (SPECTRUM_DRAW.fill / 100));
+  const top = Math.max(4, height - height * (spectrumFill / 100));
   const slot = width / count;
   const gap = Math.max(1, Math.min(3, slot * 0.22));
   const radius = Math.min(3, Math.max(1.5, slot * 0.22));
   const gradient = makeSpectrumGradient(context, width, height);
 
   context.save();
-  context.shadowColor = "rgba(80, 220, 255, 0.12)";
-  context.shadowBlur = 4;
+  context.shadowColor = "rgba(80, 220, 255, 0.14)";
+  context.shadowBlur = 8;
   context.fillStyle = gradient;
   context.beginPath();
   for (let index = 0; index < count; index += 1) {
@@ -119,6 +139,63 @@ const drawSpectrumBars = (context, width, height, frame) => {
   }
   context.fill();
   context.restore();
+};
+
+/**
+ * 获取波形数据。
+ * 优先使用共享分析器帧自带的 waveform；快照帧未提供时用 bins 线性插值合成，
+ * 保证 wave/hybrid 模式在任何数据源下都能绘制。
+ * @param {Object} frame - 频谱快照帧
+ * @returns {number[]} 归一化波形采样（-1..1，常用 256 点）
+ */
+const getSpectrumWaveform = (frame) => {
+  const waveform = frame?.waveform;
+  if (Array.isArray(waveform) && waveform.length > 1) return waveform;
+  const bins = frame?.bins || [];
+  if (bins.length < 2) return [];
+  const count = 256;
+  const output = [];
+  for (let index = 0; index < count; index += 1) {
+    const position = (index / (count - 1)) * (bins.length - 1);
+    const lower = Math.floor(position);
+    const upper = Math.min(bins.length - 1, lower + 1);
+    const fraction = position - lower;
+    const value = bins[lower] + (bins[upper] - bins[lower]) * fraction;
+    output.push(value * 2 - 1);
+  }
+  return output;
+};
+
+/** 绘制波形线（与 spectrum-visualizer 的 drawWave 一致：中心线 + 渐变描边 + 光晕） */
+const drawSpectrumWave = (context, width, height, frame) => {
+  const waveform = getSpectrumWaveform(frame);
+  if (waveform.length < 2) return;
+  const center = height * 0.5;
+  const amplitude = height * 0.25 * (spectrumFill / 100);
+
+  context.save();
+  context.globalAlpha = 0.38;
+  context.lineWidth = 2;
+  context.lineJoin = "round";
+  context.lineCap = "round";
+  context.shadowColor = spectrumColors[1];
+  context.shadowBlur = 16;
+  context.strokeStyle = makeSpectrumGradient(context, width, height);
+  context.beginPath();
+  waveform.forEach((sample, index) => {
+    const x = (index / Math.max(1, waveform.length - 1)) * width;
+    const y = center + clamp(sample, -1, 1) * amplitude;
+    if (index === 0) context.moveTo(x, y);
+    else context.lineTo(x, y);
+  });
+  context.stroke();
+  context.restore();
+};
+
+/** 混合样式：先波形线后柱状（与 spectrum-visualizer 的 hybrid 一致） */
+const drawSpectrumHybrid = (context, width, height, frame) => {
+  drawSpectrumWave(context, width, height, frame);
+  drawSpectrumBars(context, width, height, frame);
 };
 
 // ==================== 任务栏定位 ====================
@@ -384,6 +461,7 @@ export function activateWindow(ctx) {
       let receivedFromChannel = false; // 防止竞态:标记是否已从 channel 收到设置
       let settingsSyncTimer = null;    // storage 轮询定时器(BroadcastChannel 后备)
       let lastSettingsHash = "";       // 上次轮询到的设置 hash,避免重复更新
+      let colorsSyncTimer = null;      // 频谱颜色轮询定时器(读取主入口采样结果)
 
       // ============ 频谱状态 ============
       let latestSpectrumFrame = null;  // 最近一次可用的频谱帧（独立 getSnapshot 轮询获取）
@@ -391,7 +469,7 @@ export function activateWindow(ctx) {
       let spectrumCtx = null;          // canvas 2d context
       let spectrumRaf = 0;             // requestAnimationFrame id
       let spectrumLastDraw = 0;        // 上次绘制时间戳
-      let spectrumRenderFps = 15;      // 当前渲染帧率（由设置驱动）
+      let spectrumRenderFps = SPECTRUM_RENDER_FPS; // 频谱渲染帧率（固定 30）
       let snapshotPolling = false;     // getSnapshot 轮询防重入（异步 IPC 未返回时跳过下一拍）
       let snapshotLastAt = 0;          // 上次快照轮询时间戳
       let snapshotLogged = false;      // 诊断：是否已打印首帧信息
@@ -457,6 +535,37 @@ export function activateWindow(ctx) {
           // BroadcastChannel 可用，停止 storage 轮询空转
           if (settingsSyncTimer) { clearInterval(settingsSyncTimer); settingsSyncTimer = null; }
         };
+      };
+
+      /** 校验颜色数组是否为三个合法 hex 字符串 */
+      const isValidSpectrumColors = (colors) =>
+        Array.isArray(colors) &&
+        colors.length === 3 &&
+        colors.every((c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c));
+
+      /**
+       * 从本插件存储读取主入口( index.js )采样的 spectrum-visualizer 同步数据，
+       * 应用到浮窗频谱（颜色/透明度/填充；渲染帧率固定 30 FPS）。主入口周期性
+       * 采样其图层与 canvas 并写入同一存储，因此这里不依赖跨窗口 BroadcastChannel。
+       * 渲染样式固定为混合样式（波形线 + 柱状），不跟随官方模式切换。
+       */
+      const applySpectrumSync = async () => {
+        try {
+          const data = await ctx.storage.get(SPECTRUM_SYNC_KEY);
+          if (!data || typeof data !== "object") return;
+          if (isValidSpectrumColors(data.colors)) {
+            spectrumColors = data.colors;
+          }
+          if (typeof data.opacity === "number" && data.opacity >= 0 && data.opacity <= 1) {
+            spectrumOpacity = data.opacity;
+          }
+          if (typeof data.fill === "number" && data.fill > 0 && data.fill <= 100) {
+            spectrumFill = data.fill;
+          }
+          if (typeof data.backdrop === "boolean") {
+            spectrumBackdrop = data.backdrop;
+          }
+        } catch { /* 静默忽略 */ }
       };
 
       /**
@@ -587,7 +696,6 @@ export function activateWindow(ctx) {
       /** 启动频谱绘制循环（若 canvas 可用且插件启用） */
       const startSpectrumLoop = () => {
         if (!spectrumCanvas || !settings.enabled) return;
-        spectrumRenderFps = SPECTRUM_DRAW.fps;
         if (!spectrumRaf) {
           spectrumRaf = requestAnimationFrame(drawSpectrumLoop);
         }
@@ -630,10 +738,20 @@ export function activateWindow(ctx) {
 
         context.clearRect(0, 0, logicalWidth, logicalHeight);
         const frame = latestSpectrumFrame;
-        // 无真实频谱数据时不绘制任何内容
-        if (frame && frame.state !== "idle") {
-          drawSpectrumBars(context, logicalWidth, logicalHeight, frame);
+        // 背景光晕跟随官方开关（与官方一致：无论是否播放，开关开启时都绘制）
+        if (spectrumBackdrop) {
+          drawSpectrumBackdrop(context, logicalWidth, logicalHeight, frame);
         }
+        // 无真实频谱数据时不绘制频谱内容
+        if (frame && frame.state !== "idle") {
+          drawSpectrumHybrid(context, logicalWidth, logicalHeight, frame);
+        }
+        // 透明度跟随官方图层（canvas 内联样式）
+        canvas.style.opacity = String(spectrumOpacity);
+        // 背景光晕的暗色渐变（等效官方 CSS 规则）
+        canvas.style.background = spectrumBackdrop
+          ? "linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.1) 100%)"
+          : "transparent";
       };
 
       // ============ 独立频谱查询（getSnapshot 轮询，不注册共享订阅） ============
@@ -969,6 +1087,10 @@ export function activateWindow(ctx) {
         // 1. 先建立 BroadcastChannel 监听(防止竞态)
         setupChannel();
 
+        // 1b. 读取主入口采样的 spectrum-visualizer 频谱配色并轮询（跨窗口走 storage）
+        colorsSyncTimer = setInterval(() => { applySpectrumSync(); }, SPECTRUM_COLORS_INTERVAL_MS);
+        await applySpectrumSync();
+
         // 2. 获取当前播放快照
         snapshot.value = await ctx.nowPlaying.getSnapshot();
         snapshotDispose = ctx.nowPlaying.onSnapshot((next) => {
@@ -1153,6 +1275,7 @@ export function activateWindow(ctx) {
         snapshotDispose?.();
         stopClock();
         if (settingsSyncTimer) clearInterval(settingsSyncTimer);
+        if (colorsSyncTimer) clearInterval(colorsSyncTimer);
         if (keepaliveTimer) clearInterval(keepaliveTimer);
         channel?.close();
       });
@@ -1220,7 +1343,7 @@ export function activateWindow(ctx) {
         // 频谱画布（置于底层）
         const spectrumElement = h("canvas", {
           class: "tb-lyric-spectrum",
-          style: { opacity: SPECTRUM_DRAW.opacity },
+          style: { opacity: spectrumOpacity },
           ref: (el) => { spectrumCanvas = el; },
         });
 

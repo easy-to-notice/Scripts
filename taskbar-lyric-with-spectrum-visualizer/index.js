@@ -19,6 +19,15 @@ const CHANNEL_NAME = "echo-plugin:taskbar-lyric-spectrum:settings";
 /** 浮窗窗口 ID，用于窗口管理 API */
 const WINDOW_ID = "taskbar-lyric-spectrum";
 
+/** 频谱同步数据存储键（主入口采样主界面 spectrum-visualizer 的图层与 canvas，浮窗读取应用） */
+const SPECTRUM_SYNC_KEY = "spectrumSync";
+
+/** 频谱采样周期（毫秒）——颜色/透明度/填充跟随官方图层 */
+const SPECTRUM_SAMPLE_INTERVAL_MS = 1500;
+
+/** 渲染帧率（固定 30 FPS） */
+const SPECTRUM_RENDER_FPS = 30;
+
 /** 默认设置对象（与 shared.js DEFAULT_SETTINGS 同步） */
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -106,6 +115,11 @@ let heartbeatMissCount = 0;    // 连续丢失心跳计数
 let settingsDispose = null;    // 设置面板清理函数
 let windowRecoveryTimer = null; // 心跳恢复定时器（30s 检测窗口存活）
 let applyingRemoteSettings = false; // 防止设置同步循环
+let spectrumSampleTimer = null; // 频谱同步数据采样定时器（主窗口上下文采样 spectrum-visualizer 图层/canvas）
+let latestSpectrumColors = null; // 最近一次采样到的有效配色（canvas 不可用时保留旧值）
+let currentSpectrumOpacity = 0.4; // 最近读到的官方透明度
+let currentSpectrumFill = 70;     // 最近读到的官方填充率
+let spectrumBackdropState = false; // 最近读到的官方背景光晕开关
 
 /**
  * 通过 BroadcastChannel 广播设置到浮窗
@@ -133,6 +147,182 @@ const applySettings = async (ctx, values, options = {}) => {
   if (!state) return;
   state.settings = normalizeSettings(values);
   if (options.broadcast !== false) broadcastSettings();
+};
+
+// ==================== 频谱颜色采样 ====================
+
+/** 数值钳制 0-255 */
+const clampByte = (value) => Math.max(0, Math.min(255, Math.round(value || 0)));
+
+/** RGB → hex 颜色字符串 */
+const rgbToHex = (r, g, b) =>
+  `#${[clampByte(r), clampByte(g), clampByte(b)]
+    .map((v) => v.toString(16).padStart(2, "0"))
+    .join("")}`;
+
+/**
+ * 在主窗口 DOM 中查找 spectrum-visualizer 的频谱 canvas。
+ * @returns {HTMLCanvasElement|null}
+ */
+const findSpectrumCanvas = (ctx) => {
+  try {
+    const queryAll = ctx.dom?.queryAll || document.querySelectorAll.bind(document);
+    const canvases = queryAll(".echo-spectrum-canvas");
+    if (!canvases || canvases.length === 0) return null;
+    // 取面积最大的一个（优先展示明显的频谱区域）
+    let best = null;
+    for (const canvas of Array.from(canvases)) {
+      if (!(canvas instanceof HTMLCanvasElement)) continue;
+      const area = canvas.width * canvas.height;
+      if (!best || area > best.width * best.height) best = canvas;
+    }
+    return best && best.width > 2 && best.height > 2 ? best : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * 采样 spectrum-visualizer 渲染的 canvas，还原其渐变三色。
+ * spectrum-visualizer 使用 createLinearGradient(0, height, width, 0)，
+ * 三个颜色 stop 位于 0 / 0.52 / 1。这里把像素按投影位置 t 分成三档求平均色。
+ * @returns {string[]|null} 三个 hex 颜色，无法采样时返回 null
+ */
+const sampleSpectrumColors = (ctx) => {
+  const canvas = findSpectrumCanvas(ctx);
+  if (!canvas) return null;
+  let context = null;
+  try {
+    context = canvas.getContext("2d");
+  } catch { /* 跨域/污染 canvas 拒绝 */ }
+  if (!context) return null;
+
+  let imageData = null;
+  try {
+    imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  } catch {
+    return null;
+  }
+  const data = imageData.data;
+  const w = canvas.width;
+  const h = canvas.height;
+  const denom = w * w + h * h;
+
+  const sums = [
+    { r: 0, g: 0, b: 0, n: 0 },
+    { r: 0, g: 0, b: 0, n: 0 },
+    { r: 0, g: 0, b: 0, n: 0 },
+  ];
+
+  for (let y = 0; y < h; y += 2) {
+    for (let x = 0; x < w; x += 2) {
+      const index = (y * w + x) * 4;
+      const alpha = data[index + 3];
+      if (alpha < 40) continue;
+      // 像素在渐变线上的投影位置：(0,h) → (w,0)，t=0→stop0，t=1→stop2
+      const t = (x * w + (h - 1 - y) * h) / denom;
+      const bucket = t < 0.26 ? 0 : t < 0.78 ? 1 : 2;
+      sums[bucket].r += data[index];
+      sums[bucket].g += data[index + 1];
+      sums[bucket].b += data[index + 2];
+      sums[bucket].n += 1;
+    }
+  }
+
+  // 任一档像素不足则视为采样不完整（如暂停/低能量时），保留上一次值
+  if (sums[0].n < 12 || sums[1].n < 12 || sums[2].n < 12) return null;
+
+  return sums.map(({ r, g, b, n }) => rgbToHex(r / n, g / n, b / n));
+};
+
+/** 校验颜色数组是否为三个合法 hex 字符串 */
+const isValidSpectrumColors = (colors) =>
+  Array.isArray(colors) &&
+  colors.length === 3 &&
+  colors.every((c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c));
+
+/**
+ * 读取官方 spectrum-visualizer 图层暴露的样式参数。
+ * 图层上由官方插件设置了 --echo-spectrum-opacity / --echo-spectrum-fill 两个 CSS 变量，
+ * 以及 data-backdrop 背景光晕开关。
+ * @returns {{ opacity: number, fill: number, backdrop: boolean }}
+ */
+const readSpectrumLayerState = (ctx) => {
+  try {
+    const queryAll = ctx.dom?.queryAll || document.querySelectorAll.bind(document);
+    const layers = queryAll(".echo-spectrum-layer");
+    const layer = Array.from(layers || []).find((el) => el && el.style);
+    if (!layer) {
+      return {
+        opacity: currentSpectrumOpacity,
+        fill: currentSpectrumFill,
+        backdrop: spectrumBackdropState,
+      };
+    }
+    const opacity = parseFloat(layer.style.getPropertyValue("--echo-spectrum-opacity"));
+    const fill = parseFloat(layer.style.getPropertyValue("--echo-spectrum-fill"));
+    return {
+      opacity: Number.isFinite(opacity) ? opacity : currentSpectrumOpacity,
+      fill: Number.isFinite(fill) ? fill : currentSpectrumFill,
+      backdrop: layer.dataset?.backdrop === "true"
+        ? true
+        : layer.dataset?.backdrop === "false"
+          ? false
+          : spectrumBackdropState,
+    };
+  } catch {
+    return {
+      opacity: currentSpectrumOpacity,
+      fill: currentSpectrumFill,
+      backdrop: spectrumBackdropState,
+    };
+  }
+};
+
+/**
+ * 汇总一次频谱同步数据并写入插件存储（浮窗通过 storage 轮询读取）。
+ * 数据 = 实测配色 + 官方图层透明度/填充；渲染帧率固定 30 FPS。
+ * @param {Object} ctx - 插件上下文
+ */
+const syncSpectrumData = async (ctx) => {
+  try {
+    // 颜色：采样官方 canvas；失败时保留上次有效值
+    const colors = sampleSpectrumColors(ctx);
+    if (colors && isValidSpectrumColors(colors)) {
+      latestSpectrumColors = colors;
+    }
+    const { opacity, fill, backdrop } = readSpectrumLayerState(ctx);
+    currentSpectrumOpacity = opacity;
+    currentSpectrumFill = fill;
+    spectrumBackdropState = backdrop;
+    if (!latestSpectrumColors) return; // 从未采到有效配色 → 不写，浮窗沿用默认
+
+    await ctx.storage.set(SPECTRUM_SYNC_KEY, {
+      colors: latestSpectrumColors,
+      opacity,
+      fill,
+      backdrop,
+      fps: SPECTRUM_RENDER_FPS,
+    });
+  } catch { /* 采样失败静默忽略 */ }
+};
+
+/** 启动频谱同步数据采样循环 */
+const startSpectrumSampleLoop = (ctx) => {
+  if (spectrumSampleTimer) return;
+  // 立即采样一次，之后周期性刷新
+  syncSpectrumData(ctx);
+  spectrumSampleTimer = setInterval(() => {
+    syncSpectrumData(ctx);
+  }, SPECTRUM_SAMPLE_INTERVAL_MS);
+};
+
+/** 停止频谱同步数据采样循环 */
+const stopSpectrumSampleLoop = () => {
+  if (spectrumSampleTimer) {
+    clearInterval(spectrumSampleTimer);
+    spectrumSampleTimer = null;
+  }
 };
 
 /**
@@ -1094,6 +1284,14 @@ export async function activate(ctx) {
       }
     } catch { /* 忽略轮询错误 */ }
   }, 1000);
+
+  // 频谱同步数据采样：主窗口上下文周期性采样 spectrum-visualizer 的 canvas 与图层，
+  // 把配色/透明度/填充写入本插件存储，浮窗轮询后应用（跨窗口走 storage，不依赖 BroadcastChannel）。
+  // 渲染帧率固定 30 FPS，见 SPECTRUM_RENDER_FPS。
+  startSpectrumSampleLoop(ctx);
+  ctx.dispose(() => {
+    stopSpectrumSampleLoop();
+  });
 }
 
 /**
@@ -1102,6 +1300,7 @@ export async function activate(ctx) {
  */
 export function deactivate(ctx) {
   hideWindow(ctx);
+  stopSpectrumSampleLoop();
   if (windowRecoveryTimer) { clearInterval(windowRecoveryTimer); windowRecoveryTimer = null; }
   channel?.close();
   channel = null;
