@@ -25,7 +25,7 @@ const TASKBAR_FALLBACK_HEIGHT = 48;
 const SPECTRUM_PALETTE_SYNC_KEY = "spectrumPaletteSync";
 
 /** 主题色同步数据轮询间隔(毫秒) */
-const SPECTRUM_PALETTE_SYNC_INTERVAL_MS = 50; // 主题色 storage 轮询（主入口变更写入，双端 50ms）
+const SPECTRUM_PALETTE_SYNC_INTERVAL_MS = 100; // 主题色 storage 轮询
 
 /** 频谱渲染帧率上限（雾状模式最高 24，混合最高 30） */
 const SPECTRUM_RENDER_FPS = 30;
@@ -1377,7 +1377,7 @@ export function activateWindow(ctx) {
         // 1. 先建立 BroadcastChannel 监听(防止竞态)
         setupChannel();
 
-        // 1b. 快速轮询主入口写入的主题色（单一 storage 同步方案，双端 50ms）
+        // 1b. 快速轮询主入口写入的主题色（单一 storage 同步方案）
         paletteSyncTimer = setInterval(() => { applyPaletteSync(); }, SPECTRUM_PALETTE_SYNC_INTERVAL_MS);
         await applyPaletteSync();
 

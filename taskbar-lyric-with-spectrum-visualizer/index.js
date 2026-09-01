@@ -23,7 +23,7 @@ const WINDOW_ID = "taskbar-lyric-spectrum";
 const SPECTRUM_PALETTE_SYNC_KEY = "spectrumPaletteSync";
 
 /** 主题色采样周期（毫秒）——单一 storage 同步方案：主入口读 CSS 变量 + 变更写入，浮窗快速轮询 */
-const SPECTRUM_PALETTE_SAMPLE_INTERVAL_MS = 50;
+const SPECTRUM_PALETTE_SAMPLE_INTERVAL_MS = 100;
 
 /** 渲染帧率（固定 30 FPS） */
 const SPECTRUM_RENDER_FPS = 30;
