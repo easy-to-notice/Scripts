@@ -2,7 +2,7 @@
 
 > EchoMusic 插件 — 在 Windows 任务栏上方显示当前歌词和封面，并在浮窗底部绘制实时音频频谱
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.1-blue)
 ![EchoMusic](https://img.shields.io/badge/EchoMusic-%3E%3D2.2.9--beta.1-green)
 
 基于以下两个插件使用 opencode 开发，将实时频谱嵌入任务栏歌词浮窗底部：
@@ -167,6 +167,9 @@ taskbar-lyric-with-spectrum-visualizer/
 | 置顶保活 | `screen-saver` 级一次性置顶 + BroadcastChannel 心跳软恢复 |
 
 ## 更新日志
+
+### v1.3.1
+- 更新：更新插件描述信息
 
 ### v1.3.0
 - 新增：频谱配置部分独立
